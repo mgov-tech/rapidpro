@@ -1,45 +1,45 @@
-
-import copy
-import json
 import subprocess
 import time
 import uuid
 from datetime import date, datetime, timedelta
+from decimal import Decimal
+from unittest.mock import PropertyMock, patch
 
 import pytz
-from mock import patch
 from openpyxl import load_workbook
 from smartmin.csv_imports.models import ImportTask
 from smartmin.models import SmartImportRowError
-from smartmin.tests import SmartminTestMixin, _CRUDLTest
 
 from django.conf import settings
 from django.core.files.base import ContentFile
-from django.core.urlresolvers import reverse
+from django.db import connection
 from django.db.models import Value as DbValue
 from django.db.models.functions import Concat, Substr
-from django.test import TestCase, TransactionTestCase
+from django.test import TestCase
 from django.test.utils import override_settings
+from django.urls import reverse
 from django.utils import timezone
 
-from temba.api.models import WebHookEvent, WebHookResult
+from temba.airtime.models import AirtimeTransfer
+from temba.api.models import WebHookResult
 from temba.campaigns.models import Campaign, CampaignEvent, EventFire
 from temba.channels.models import Channel, ChannelEvent, ChannelLog
 from temba.contacts.models import DELETED_SCHEME
-from temba.contacts.search import contact_es_search, evaluate_query, is_phonenumber
+from temba.contacts.search import SearchException, SearchResults, evaluate_query, is_phonenumber, search_contacts
+from temba.contacts.search.tests import MockParseQuery
 from temba.contacts.views import ContactListView
 from temba.flows.models import Flow, FlowRun
 from temba.ivr.models import IVRCall
 from temba.locations.models import AdminBoundary
-from temba.msgs.models import INCOMING, Broadcast, BroadcastRecipient, Label, Msg, SystemLabel
+from temba.mailroom import MailroomException
+from temba.msgs.models import Broadcast, Label, Msg, SystemLabel
 from temba.orgs.models import Org
 from temba.schedules.models import Schedule
-from temba.tests import AnonymousOrg, ESMockWithScroll, TembaTest, TembaTestMixin
-from temba.tests.twilio import MockRequestValidator, MockTwilioClient
+from temba.tests import AnonymousOrg, CRUDLTestMixin, ESMockWithScroll, MockPost, TembaNonAtomicTest, TembaTest
+from temba.tests.engine import MockSessionWriter
 from temba.triggers.models import Trigger
-from temba.utils.dates import datetime_to_ms, datetime_to_str, get_datetime_format
-from temba.utils.es import ES
-from temba.utils.profiler import QueryTracker
+from temba.utils import json
+from temba.utils.dates import datetime_to_ms, datetime_to_str
 from temba.values.constants import Value
 
 from .models import (
@@ -54,126 +54,199 @@ from .models import (
     ContactURN,
     ExportContactsTask,
 )
-from .search import (
-    BoolCombination,
-    Condition,
-    ContactQuery,
-    IsSetCondition,
-    SearchException,
-    SinglePropCombination,
-    parse_query,
-)
+from .search import BoolCombination, Condition, ContactQuery, IsSetCondition, SinglePropCombination, legacy_parse_query
 from .tasks import check_elasticsearch_lag, squash_contactgroupcounts
-from .templatetags.contacts import activity_icon, contact_field, history_class
+from .templatetags.contacts import contact_field, history_class, history_icon
 
 
-class ContactCRUDLTest(_CRUDLTest):
+class ContactCRUDLTest(TembaTest):
     def setUp(self):
-        from temba.contacts.views import ContactCRUDL
-
         super().setUp()
 
         self.country = AdminBoundary.create(osm_id="171496", name="Rwanda", level=0)
         AdminBoundary.create(osm_id="1708283", name="Kigali", level=1, parent=self.country)
 
-        self.crudl = ContactCRUDL
-        self.user = self.create_user("tito")
-        self.org = Org.objects.create(
-            name="Nyaruka Ltd.",
-            timezone="Africa/Kigali",
-            country=self.country,
-            created_by=self.user,
-            modified_by=self.user,
-        )
-        self.org.administrators.add(self.user)
-        self.user.set_org(self.org)
-        self.org.initialize()
-
         ContactField.get_or_create(self.org, self.user, "age", "Age", value_type="N")
         ContactField.get_or_create(self.org, self.user, "home", "Home", value_type="S", priority=10)
 
-    def getCreatePostData(self):
-        return dict(name="Joe Brady", urn__tel__0="+250785551212")
+        # sample flows don't actually get created by org initialization during tests because there are no users at that
+        # point so create them explicitly here, so that we also get the sample groups
+        self.org.create_sample_flows("https://api.rapidpro.io")
 
-    def getUpdatePostData(self):
-        return dict(name="Joe Brady", urn__tel__0="+250785551212")
+    def test_list(self):
+        self.login(self.user)
+        list_url = reverse("contacts.contact_list")
 
-    def getTestObject(self):
-        if self.object:
-            return self.object
-
-        if self.getCRUDL().permissions:
-            self.login(self.getUser())
-
-        # create our object
-        create_page = reverse(self.getCRUDL().url_name_for_action("create"))
-        post_data = self.getCreatePostData()
-        self.client.post(create_page, data=post_data)
-
-        # find our created object
-        self.object = Contact.objects.get(org=self.org, urns__path=post_data["urn__tel__0"], name=post_data["name"])
-        return self.object
-
-    def testList(self):
         self.joe, urn_obj = Contact.get_or_create(self.org, "tel:123", user=self.user, name="Joe")
-        self.joe.set_field(self.user, "age", 20)
+        self.joe.set_field(self.user, "age", "20")
         self.joe.set_field(self.user, "home", "Kigali")
         self.frank, urn_obj = Contact.get_or_create(self.org, "tel:124", user=self.user, name="Frank")
-        self.frank.set_field(self.user, "age", 18)
+        self.frank.set_field(self.user, "age", "18")
 
-        response = self._do_test_view("list")
+        creating = ContactGroup.create_static(
+            self.org, self.user, "Group being created", status=ContactGroup.STATUS_INITIALIZING
+        )
+
+        response = self.client.get(list_url)
         self.assertEqual(set(response.context["object_list"]), {self.frank, self.joe})
         self.assertIsNone(response.context["search_error"])
 
-        with patch("temba.utils.es.ES") as mock_ES:
-            mock_ES.search.return_value = {"_hits": [{"id": self.frank.id}]}
-            mock_ES.count.return_value = {"count": 1}
+        survey_audience = ContactGroup.user_groups.get(org=self.org, name="Survey Audience")
+        unsatisfied = ContactGroup.user_groups.get(org=self.org, name="Unsatisfied Customers")
 
-            response = self._do_test_view("list", query_string="search=age+%3D+18")
+        self.assertEqual(
+            response.context["groups"],
+            [
+                {
+                    "uuid": str(creating.uuid),
+                    "pk": creating.id,
+                    "label": "Group being created",
+                    "is_dynamic": False,
+                    "is_ready": False,
+                    "count": 0,
+                },
+                {
+                    "uuid": str(survey_audience.uuid),
+                    "pk": survey_audience.id,
+                    "label": "Survey Audience",
+                    "is_dynamic": False,
+                    "is_ready": True,
+                    "count": 0,
+                },
+                {
+                    "uuid": str(unsatisfied.uuid),
+                    "pk": unsatisfied.id,
+                    "label": "Unsatisfied Customers",
+                    "is_dynamic": False,
+                    "is_ready": True,
+                    "count": 0,
+                },
+            ],
+        )
+
+        with patch("temba.mailroom.client.MailroomClient") as mock_mr:
+            instance = mock_mr.return_value
+            instance.contact_search.return_value = {
+                "contact_ids": [self.frank.id],
+                "total": 1,
+                "query": "age = 18",
+                "fields": ["age"],
+                "allow_as_group": True,
+            }
+
+            response = self.client.get(list_url + "?search=age+%3D+18")
             self.assertEqual(list(response.context["object_list"]), [self.frank])
             self.assertEqual(response.context["search"], "age = 18")
             self.assertEqual(response.context["save_dynamic_search"], True)
             self.assertIsNone(response.context["search_error"])
             self.assertEqual(list(response.context["contact_fields"].values_list("label", flat=True)), ["Home", "Age"])
 
-        with patch("temba.utils.es.ES") as mock_ES:
-            mock_ES.search.return_value = {"_hits": [{"id": self.joe.id}]}
-            mock_ES.count.return_value = {"count": 1}
+        with patch("temba.mailroom.client.MailroomClient") as mock_mr:
+            instance = mock_mr.return_value
+            instance.contact_search.return_value = {
+                "contact_ids": [self.frank.id],
+                "total": 10020,
+                "query": "age = 18",
+                "fields": ["age"],
+                "allow_as_group": True,
+            }
 
-            response = self._do_test_view("list", query_string='search=age+>+18+and+home+%3D+"Kigali"')
+            # we return up to 10000 contacts when searching with ES, so last page is 200
+            url = f'{reverse("contacts.contact_list")}?{"search=age+%3D+18&page=200"}'
+            response = self.client.get(url)
+
+            self.assertEqual(response.status_code, 200)
+
+            # when user requests page 201, we return a 404, page not found
+            url = f'{reverse("contacts.contact_list")}?{"search=age+%3D+18&page=201"}'
+            response = self.client.get(url)
+
+            self.assertEqual(response.status_code, 404)
+
+        with patch("temba.mailroom.client.MailroomClient") as mock_mr:
+            instance = mock_mr.return_value
+            instance.contact_search.return_value = {
+                "contact_ids": [self.joe.id],
+                "total": 1,
+                "query": 'age > 18 AND home = "Kigali"',
+                "fields": ["age", "home"],
+                "allow_as_group": True,
+            }
+
+            response = self.client.get(list_url + '?search=age+>+18+and+home+%3D+"Kigali"')
             self.assertEqual(list(response.context["object_list"]), [self.joe])
             self.assertEqual(response.context["search"], 'age > 18 AND home = "Kigali"')
             self.assertEqual(response.context["save_dynamic_search"], True)
             self.assertIsNone(response.context["search_error"])
 
-        with patch("temba.utils.es.ES") as mock_ES:
-            mock_ES.search.return_value = {"_hits": [{"id": self.joe.id}]}
-            mock_ES.count.return_value = {"count": 1}
+        with patch("temba.mailroom.client.MailroomClient") as mock_mr:
+            instance = mock_mr.return_value
+            instance.contact_search.return_value = {
+                "contact_ids": [self.joe.id],
+                "total": 1,
+                "query": 'name ~ "Joe"',
+                "fields": ["name"],
+                "allow_as_group": True,
+            }
 
-            response = self._do_test_view("list", query_string="search=Joe")
+            response = self.client.get(list_url + "?search=Joe")
             self.assertEqual(list(response.context["object_list"]), [self.joe])
             self.assertEqual(response.context["search"], 'name ~ "Joe"')
-            self.assertEqual(response.context["save_dynamic_search"], False)
+            self.assertEqual(response.context["save_dynamic_search"], True)
             self.assertIsNone(response.context["search_error"])
 
-        # try with invalid search string
-        response = self._do_test_view("list", query_string="search=(((")
-        self.assertEqual(list(response.context["object_list"]), [])
-        self.assertEqual(response.context["search_error"], "Search query contains an error")
+        with AnonymousOrg(self.org):
+            with patch("temba.mailroom.client.MailroomClient") as mock_mr:
+                instance = mock_mr.return_value
+                instance.contact_search.return_value = {
+                    "contact_ids": [self.joe.id],
+                    "total": 1,
+                    "query": f"id = {self.joe.id}",
+                    "fields": ["id"],
+                    "allow_as_group": False,
+                }
 
-    def testRead(self):
+                response = self.client.get(list_url + f"?search={self.joe.id}")
+                self.assertEqual(list(response.context["object_list"]), [self.joe])
+                self.assertIsNone(response.context["search_error"])
+                self.assertEqual(response.context["search"], f"id = {self.joe.id}")
+                self.assertEqual(response.context["save_dynamic_search"], False)
+
+        # try with invalid search string
+        with patch("temba.mailroom.client.MailroomClient") as mock_mr:
+            instance = mock_mr.return_value
+            instance.contact_search.side_effect = MailroomException(
+                "", "", {"error": "Search query contains an error"}
+            )
+
+            response = self.client.get(list_url + "?search=(((")
+            self.assertEqual(list(response.context["object_list"]), [])
+            self.assertEqual(response.context["search_error"], "Search query contains an error")
+
+    def test_read(self):
         self.joe, urn_obj = Contact.get_or_create(self.org, "tel:123", user=self.user, name="Joe")
+        other_org_contact = self.create_contact("Hans", number="+593979123456", org=self.org2)
 
         read_url = reverse("contacts.contact_read", args=[self.joe.uuid])
-        response = self.client.get(read_url)
-        self.assertRedirect(response, "/users/login/")
+        block_url = reverse("contacts.contact_block", args=[self.joe.id])
 
+        response = self.client.get(read_url)
+        self.assertLoginRedirect(response)
+
+        # login as viewer
         self.login(self.user)
+
         response = self.client.get(read_url)
         self.assertContains(response, "Joe")
 
-        # make sure the block link is present
-        block_url = reverse("contacts.contact_block", args=[self.joe.id])
+        # make sure the block link is not present
+        self.assertNotContains(response, block_url)
+
+        # login as admin
+        self.login(self.admin)
+
+        # make sure the block link is present now
+        response = self.client.get(read_url)
         self.assertContains(response, block_url)
 
         # and that it works
@@ -188,44 +261,126 @@ class ContactCRUDLTest(_CRUDLTest):
         self.client.post(unblock_url, dict(id=self.joe.id))
         self.assertTrue(Contact.objects.get(pk=self.joe.id, is_blocked=False))
 
-        response = self.client.get(read_url)
+        # can't block contacts from other orgs
+        response = self.client.post(reverse("contacts.contact_block", args=[other_org_contact.id]))
+        self.assertLoginRedirect(response)
+
+        # contact should be unchanged
+        other_org_contact.refresh_from_db()
+        self.assertFalse(other_org_contact.is_blocked)
+
+        # or unblock...
+        other_org_contact.block(self.admin2)
+
+        response = self.client.post(reverse("contacts.contact_unblock", args=[other_org_contact.id]))
+        self.assertLoginRedirect(response)
+
+        # contact should be unchanged
+        other_org_contact.refresh_from_db()
+        self.assertTrue(other_org_contact.is_blocked)
+
         unstop_url = reverse("contacts.contact_unstop", args=[self.joe.id])
-        self.assertFalse(unstop_url in response)
-
-        # stop the contact
-        self.joe.stop(self.user)
-        self.assertFalse(Contact.objects.filter(pk=self.joe.id, is_stopped=False))
-        response = self.client.get(read_url)
-        self.assertContains(response, unstop_url)
-
-        self.client.post(unstop_url, dict(id=self.joe.id))
-        self.assertTrue(Contact.objects.filter(pk=self.joe.id, is_stopped=False))
-
-        # ok, what about deleting?
-        response = self.client.get(read_url)
         delete_url = reverse("contacts.contact_delete", args=[self.joe.id])
+
+        response = self.client.get(read_url)
+
+        self.assertNotContains(response, unstop_url)
         self.assertContains(response, delete_url)
 
-        self.client.post(delete_url, dict(id=self.joe.id))
-        self.assertIsNotNone(Contact.objects.get(pk=self.joe.id, is_active=False))
+        # unstop option available for stopped contacts
+        self.joe.stop(self.user)
+        response = self.client.get(read_url)
 
-        # can no longer access
+        self.assertContains(response, unstop_url)
+        self.assertContains(response, delete_url)
+
+        # can't access a deleted contact
+        self.joe.release(self.admin)
+
         response = self.client.get(read_url)
         self.assertEqual(response.status_code, 404)
+
+        # contact with only a urn
+        nameless = self.create_contact("", twitter="bobby_anon")
+        response = self.client.get(reverse("contacts.contact_read", args=[nameless.uuid]))
+        self.assertContains(response, "bobby_anon")
+
+        # contact without name or urn
+        nameless = Contact.objects.create(org=self.org)
+        response = self.client.get(reverse("contacts.contact_read", args=[nameless.uuid]))
+        self.assertContains(response, "Contact Details")
 
         # invalid uuid should return 404
         response = self.client.get(reverse("contacts.contact_read", args=["invalid-uuid"]))
         self.assertEqual(response.status_code, 404)
 
-    def testDelete(self):
-        object = self.getTestObject()
-        self._do_test_view("delete", object, post_data=dict())
+    def test_unstop(self):
+        contact = self.create_contact("Joe", number="+593979000111")
+        contact.stop(self.admin)
+        other_org_contact = self.create_contact("Hans", number="+593979123456", org=self.org2)
+        other_org_contact.stop(self.admin2)
 
-        # we should be deactivated
-        self.assertFalse(self.getCRUDL().model.objects.get(pk=object.pk).is_active)
+        unstop_url = reverse("contacts.contact_unstop", args=[contact.id])
 
-        # since we are eager, our other bits should be gone
-        self.assertEqual(0, ContactURN.objects.all().count())
+        # can't unstop if not logged in
+        response = self.client.post(unstop_url, {"id": contact.id})
+        self.assertLoginRedirect(response)
+
+        self.login(self.user)
+
+        # can't unstop if just regular user
+        response = self.client.post(unstop_url, {"id": contact.id})
+        self.assertLoginRedirect(response)
+
+        self.login(self.admin)
+
+        response = self.client.post(unstop_url, {"id": contact.id})
+        self.assertEqual(302, response.status_code)
+
+        contact.refresh_from_db()
+        self.assertFalse(contact.is_stopped)
+
+        # can't unstop contact in other org
+        unstop_url = reverse("contacts.contact_unstop", args=[other_org_contact.id])
+        response = self.client.post(unstop_url, {"id": other_org_contact.id})
+        self.assertLoginRedirect(response)
+
+        # contact should be unchanged
+        other_org_contact.refresh_from_db()
+        self.assertTrue(other_org_contact.is_stopped)
+
+    def test_delete(self):
+        contact = self.create_contact("Joe", number="+593979000111")
+        other_org_contact = self.create_contact("Hans", number="+593979123456", org=self.org2)
+
+        delete_url = reverse("contacts.contact_delete", args=[contact.id])
+
+        # can't delete if not logged in
+        response = self.client.post(delete_url, {"id": contact.id})
+        self.assertLoginRedirect(response)
+
+        self.login(self.user)
+
+        # can't delete if just regular user
+        response = self.client.post(delete_url, {"id": contact.id})
+        self.assertLoginRedirect(response)
+
+        self.login(self.admin)
+
+        response = self.client.post(delete_url, {"id": contact.id})
+        self.assertEqual(302, response.status_code)
+
+        contact.refresh_from_db()
+        self.assertFalse(contact.is_active)
+
+        # can't delete contact in other org
+        delete_url = reverse("contacts.contact_delete", args=[other_org_contact.id])
+        response = self.client.post(delete_url, {"id": other_org_contact.id})
+        self.assertLoginRedirect(response)
+
+        # contact should be unchanged
+        other_org_contact.refresh_from_db()
+        self.assertTrue(other_org_contact.is_active)
 
 
 class ContactGroupTest(TembaTest):
@@ -251,27 +406,16 @@ class ContactGroupTest(TembaTest):
         self.assertRaises(ValueError, ContactGroup.create_static, self.org, self.admin, "   ")
 
     def test_create_dynamic(self):
+        name = ContactField.system_fields.filter(org=self.org, key="name").get()
         age = ContactField.get_or_create(self.org, self.admin, "age", value_type=Value.TYPE_NUMBER)
         gender = ContactField.get_or_create(self.org, self.admin, "gender", priority=10)
-        self.joe.set_field(self.admin, "age", 17)
+        self.joe.set_field(self.admin, "age", "17")
         self.joe.set_field(self.admin, "gender", "male")
-        self.mary.set_field(self.admin, "age", 21)
+        self.mary.set_field(self.admin, "age", "21")
         self.mary.set_field(self.admin, "gender", "female")
 
         # create a dynamic group using a query
-        mock_es_data = [
-            {
-                "_type": "_doc",
-                "_index": "dummy_index",
-                "_source": {"id": self.joe.id, "modified_on": self.joe.modified_on.isoformat()},
-            },
-            {
-                "_type": "_doc",
-                "_index": "dummy_index",
-                "_source": {"id": self.mary.id, "modified_on": self.mary.modified_on.isoformat()},
-            },
-        ]
-        with ESMockWithScroll(data=mock_es_data):
+        with MockParseQuery('(age < 18 AND gender = "male") OR (age > 18 AND gender = "female")', ["age", "gender"]):
             group = ContactGroup.create_dynamic(
                 self.org, self.admin, "Group two", '(Age < 18 and gender = "male") or (Age > 18 and gender = "female")'
             )
@@ -279,34 +423,23 @@ class ContactGroupTest(TembaTest):
         group.refresh_from_db()
         self.assertEqual(group.query, '(age < 18 AND gender = "male") OR (age > 18 AND gender = "female")')
         self.assertEqual(set(group.query_fields.all()), {age, gender})
-        self.assertEqual(set(group.contacts.all()), {self.joe, self.mary})
-        self.assertEqual(group.status, ContactGroup.STATUS_READY)
+        self.assertEqual(group.status, ContactGroup.STATUS_INITIALIZING)
 
         # update group query
-        mock_es_data = [
-            {
-                "_type": "_doc",
-                "_index": "dummy_index",
-                "_source": {"id": self.mary.id, "modified_on": self.mary.modified_on.isoformat()},
-            }
-        ]
-        with ESMockWithScroll(data=mock_es_data):
-            group.update_query("age > 18")
+        with MockParseQuery('age > 18 AND name ~ "Mary"', ["age", "name"]):
+            group.update_query("age > 18 and name ~ Mary")
 
         group.refresh_from_db()
-        self.assertEqual(group.query, "age > 18")
-        self.assertEqual(set(group.query_fields.all()), {age})
-        self.assertEqual(set(group.contacts.all()), {self.mary})
-        self.assertEqual(group.status, ContactGroup.STATUS_READY)
+        self.assertEqual(group.query, 'age > 18 AND name ~ "Mary"')
+        self.assertEqual(set(group.query_fields.all()), {age, name})
+        self.assertEqual(group.status, ContactGroup.STATUS_INITIALIZING)
 
         # can't create a dynamic group with empty query
         self.assertRaises(ValueError, ContactGroup.create_dynamic, self.org, self.admin, "Empty", "")
 
-        # can't create a dynamic group with name attribute
-        self.assertRaises(ValueError, ContactGroup.create_dynamic, self.org, self.admin, "Jose", 'name = "Jose"')
-
         # can't create a dynamic group with id attribute
-        self.assertRaises(ValueError, ContactGroup.create_dynamic, self.org, self.admin, "Bose", "id = 123")
+        with MockParseQuery("id = 123", ["id"], allow_as_group=False):
+            self.assertRaises(ValueError, ContactGroup.create_dynamic, self.org, self.admin, "Bose", "id = 123")
 
         # can't call update_contacts on a dynamic group
         self.assertRaises(ValueError, group.update_contacts, self.admin, [self.joe], True)
@@ -325,30 +458,10 @@ class ContactGroupTest(TembaTest):
         with self.assertRaises(ValueError):
             group.update_query("age = 18")
 
-        # can't call reevaluate on it while it is in this state
-        with self.assertRaises(ValueError):
-            group.reevaluate()
-
-    def test_evaluate_dynamic_groups_from_flow(self):
-        flow = self.get_flow("initialize")
-        self.joe, urn_obj = Contact.get_or_create(self.org, "tel:123", user=self.admin, name="Joe Blow")
-
-        with ESMockWithScroll():
-            fields = [
-                "total_calls_made",
-                "total_emails_sent",
-                "total_faxes_sent",
-                "total_letters_mailed",
-                "address_changes",
-                "name_changes",
-                "total_editorials_submitted",
-            ]
-            for key in fields:
-                ContactField.get_or_create(self.org, self.admin, key, value_type=Value.TYPE_NUMBER)
-                ContactGroup.create_dynamic(self.org, self.admin, "Group %s" % (key), "(%s > 10)" % key)
-
-        with QueryTracker(assert_query_count=110, stack_count=16, skip_unique_queries=False):
-            flow.start([], [self.joe])
+    def test_query_elasticsearch_for_ids_bad_query(self):
+        with self.assertRaises(SearchException):
+            with MockParseQuery(error="bad field <> error"):
+                Contact.query_elasticsearch_for_ids(self.org, "bad_field <> error")
 
     def test_get_or_create(self):
         group = ContactGroup.get_or_create(self.org, self.user, " first ")
@@ -359,7 +472,7 @@ class ContactGroupTest(TembaTest):
         self.assertEqual(ContactGroup.get_or_create(self.org, self.user, "  FIRST"), group)
 
         # fetching by id shouldn't modify original group
-        self.assertEqual(ContactGroup.get_or_create(self.org, self.user, "Kigali", group.uuid), group)
+        self.assertEqual(ContactGroup.get_or_create(self.org, self.user, "Kigali", uuid=group.uuid), group)
 
         group.refresh_from_db()
         self.assertEqual(group.name, "first")
@@ -371,8 +484,9 @@ class ContactGroupTest(TembaTest):
         deleted.is_active = False
         deleted.save()
 
-        with ESMockWithScroll():
+        with MockParseQuery('gender = "M"', ["gender"]):
             dynamic = ContactGroup.create_dynamic(self.org, self.admin, "Dynamic", "gender=M")
+            ContactGroup.user_groups.filter(id=dynamic.id).update(status=ContactGroup.STATUS_READY)
 
         self.assertEqual(set(ContactGroup.get_user_groups(self.org)), {static, dynamic})
         self.assertEqual(set(ContactGroup.get_user_groups(self.org, dynamic=False)), {static})
@@ -407,14 +521,6 @@ class ContactGroupTest(TembaTest):
 
         self.assertEqual(ContactGroup.user_groups.get(pk=group.pk).get_member_count(), 2)
 
-        # add test contact (will add to group but won't increment count)
-        test_contact = Contact.get_test_contact(self.admin)
-        group.update_contacts(self.user, [test_contact], add=True)
-
-        group = ContactGroup.user_groups.get(pk=group.pk)
-        self.assertEqual(group.get_member_count(), 2)
-        self.assertEqual(set(group.contacts.all()), {self.joe, self.frank, test_contact})
-
         # blocking a contact removes them from all user groups
         self.joe.block(self.user)
 
@@ -423,7 +529,7 @@ class ContactGroupTest(TembaTest):
 
         group = ContactGroup.user_groups.get(pk=group.pk)
         self.assertEqual(group.get_member_count(), 1)
-        self.assertEqual(set(group.contacts.all()), {self.frank, test_contact})
+        self.assertEqual(set(group.contacts.all()), {self.frank})
 
         # unblocking won't re-add to any groups
         self.joe.unblock(self.user)
@@ -435,7 +541,7 @@ class ContactGroupTest(TembaTest):
 
         group = ContactGroup.user_groups.get(pk=group.pk)
         self.assertEqual(group.get_member_count(), 0)
-        self.assertEqual(set(group.contacts.all()), {test_contact})
+        self.assertEqual(set(group.contacts.all()), set())
 
     def test_system_group_counts(self):
         # start with none
@@ -516,7 +622,7 @@ class ContactGroupTest(TembaTest):
         second_trigger.groups.add(group)
 
         response = self.client.get(delete_url, dict(), HTTP_X_PJAX=True)
-        self.assertContains(response, "This group is used by 2 triggers.")
+        self.assertContains(response, 'This group is used by <a href="/trigger/">2 triggers<a>')
 
         response = self.client.post(delete_url, dict())
         self.assertEqual(302, response.status_code)
@@ -543,6 +649,35 @@ class ContactGroupTest(TembaTest):
         self.assertFalse(ContactGroup.all_groups.get(pk=group.pk).is_active)
         self.assertFalse(Trigger.objects.get(pk=trigger.pk).is_active)
         self.assertFalse(Trigger.objects.get(pk=second_trigger.pk).is_active)
+
+    def test_group_release_deactivates_campaign(self):
+        a_group = self.create_group("one")
+        delete_url = reverse("contacts.contactgroup_delete", args=[a_group.pk])
+
+        self.get_flow("favorites")
+
+        self.login(self.admin)
+
+        post_data = dict(name="YAC - Yet another campaign", group=a_group.pk)
+        self.client.post(reverse("campaigns.campaign_create"), post_data)
+
+        a_campaign = Campaign.objects.first()
+
+        response = self.client.get(delete_url, dict(), HTTP_X_PJAX=True)
+        self.assertContains(response, "There is an active campaign using this group.")
+
+        # archive the campaign
+        self.client.post(reverse("campaigns.campaign_archive", args=(a_campaign.pk,)))
+
+        response = self.client.get(delete_url, dict(), HTTP_X_PJAX=True)
+        self.assertContains(response, "Are you sure?")
+
+        response = self.client.post(delete_url, dict(), HTTP_X_PJAX=True)
+        self.assertContains(response, "document.location.href = '/contact/';")
+
+        # group and campaign are no longer active
+        self.assertFalse(ContactGroup.all_groups.get(pk=a_group.pk).is_active)
+        self.assertFalse(Campaign.objects.get(pk=a_campaign.pk).is_active)
 
     def test_delete_fail_with_dependencies(self):
         self.login(self.admin)
@@ -574,6 +709,25 @@ class ContactGroupTest(TembaTest):
 
         response = self.client.post(delete_url, dict(), HTTP_X_PJAX=True)
         self.assertIsNone(ContactGroup.user_groups.filter(id=cats.id).first())
+
+    def test_delete_with_campaign_dependencies(self):
+        block_group = self.create_group("one that blocks")
+
+        self.login(self.admin)
+
+        post_data = dict(name="Don't forget to ...", group=block_group.pk)
+        self.client.post(reverse("campaigns.campaign_create"), post_data)
+
+        delete_url = reverse("contacts.contactgroup_delete", args=[block_group.pk])
+
+        # users are notified that a group cannot be deleted
+        response = self.client.get(delete_url, dict(), HTTP_X_PJAX=True)
+        self.assertContains(response, "There is an active campaign using this group")
+
+        # can't delete if it is a dependency
+        response = self.client.post(delete_url, dict())
+        self.assertRedirect(response, f"/contact/filter/{block_group.uuid}/")
+        self.assertTrue(ContactGroup.user_groups.get(id=block_group.id).is_active)
 
 
 class ElasticSearchLagTest(TembaTest):
@@ -628,8 +782,10 @@ class ContactGroupCRUDLTest(TembaTest):
 
         self.joe_and_frank = self.create_group("Customers", [self.joe, self.frank])
 
-        with ESMockWithScroll():
+        with MockParseQuery("tel = 1234", ["tel"]):
             self.dynamic_group = self.create_group("Dynamic", query="tel is 1234")
+
+        self.other_org_group = self.create_group("Customers", contacts=[], org=self.org2)
 
     @patch.object(ContactGroup, "MAX_ORG_CONTACTGROUPS", new=10)
     def test_create(self):
@@ -665,21 +821,12 @@ class ContactGroupCRUDLTest(TembaTest):
         self.assertEqual(set(group.contacts.all()), {self.joe, self.frank})
 
         # create a dynamic group using a query
-        mock_es_data = [
-            {
-                "_type": "_doc",
-                "_index": "dummy_index",
-                "_source": {"id": self.frank.id, "modified_on": self.frank.modified_on.isoformat()},
-            }
-        ]
-        with ESMockWithScroll(data=mock_es_data):
+        with MockParseQuery("tel = 1234", ["tel"]):
             self.client.post(url, dict(name="Frank", group_query="tel = 1234"))
 
-        group = ContactGroup.user_groups.get(org=self.org, name="Frank", query="tel = 1234")
-        self.assertEqual(set(group.contacts.all()), {self.frank})
+        ContactGroup.user_groups.get(org=self.org, name="Frank", query="tel = 1234")
 
-        self.create_secondary_org()
-        self.release(ContactGroup.user_groups.all())
+        self.bulk_release(ContactGroup.user_groups.all())
 
         for i in range(ContactGroup.MAX_ORG_CONTACTGROUPS):
             ContactGroup.create_static(self.org2, self.admin2, "group%d" % i)
@@ -688,7 +835,7 @@ class ContactGroupCRUDLTest(TembaTest):
         self.assertNoFormErrors(response)
         ContactGroup.user_groups.get(org=self.org, name="People")
 
-        self.release(ContactGroup.user_groups.all())
+        self.bulk_release(ContactGroup.user_groups.all())
 
         for i in range(ContactGroup.MAX_ORG_CONTACTGROUPS):
             ContactGroup.create_static(self.org, self.admin, "group%d" % i)
@@ -703,8 +850,28 @@ class ContactGroupCRUDLTest(TembaTest):
             "You must delete existing ones before you can create new ones.",
         )
 
+    def test_create_disallow_duplicates(self):
+        self.login(self.admin)
+
+        self.client.post(reverse("contacts.contactgroup_create"), dict(name="First Group"))
+
+        # assert it was created
+        ContactGroup.user_groups.get(name="First Group")
+
+        # try to create another group with the same name, but a dynamic query, should fail
+        response = self.client.post(
+            reverse("contacts.contactgroup_create"), dict(name="First Group", group_query="firsts")
+        )
+        self.assertFormError(response, "form", "name", "Name is used by another group")
+
+        # try to create another group with same name, not dynamic, same thing
+        response = self.client.post(
+            reverse("contacts.contactgroup_create"), dict(name="First Group", group_query="firsts")
+        )
+        self.assertFormError(response, "form", "name", "Name is used by another group")
+
     def test_update(self):
-        url = reverse("contacts.contactgroup_update", args=[self.joe_and_frank.pk])
+        url = reverse("contacts.contactgroup_update", args=[self.joe_and_frank.id])
 
         # can't create group as viewer
         self.login(self.user)
@@ -731,49 +898,62 @@ class ContactGroupCRUDLTest(TembaTest):
         # now try a dynamic group
         url = reverse("contacts.contactgroup_update", args=[self.dynamic_group.pk])
 
-        # update both name and query, form should fail, because group can not be saved as a dynamic group
-        response = self.client.post(url, dict(name="Frank", query="frank"))
-        self.assertFormError(response, "form", "query", 'You cannot create a dynamic group based on "name" or "id".')
+        # mark our group as ready
+        ContactGroup.user_groups.filter(id=self.dynamic_group.pk).update(status=ContactGroup.STATUS_READY)
 
         # update both name and query, form should fail, because query is not parsable
-        response = self.client.post(url, dict(name="Frank", query="(!))!)"))
-        self.assertFormError(response, "form", "query", "Search query contains an error at: !")
+        with MockParseQuery(error="error at !"):
+            response = self.client.post(url, dict(name="Frank", query="(!))!)"))
+            self.assertFormError(response, "form", "query", "error at !")
 
-        response = self.client.post(url, dict(name="Frank", query="id = 123"))
-        self.assertFormError(response, "form", "query", 'You cannot create a dynamic group based on "name" or "id".')
+        # try to update a group with an invalid query
+        with MockPost({"error": "error at >"}, status=400):
+            response = self.client.post(url, dict(name="Frank", query="name <> some_name"))
+            self.assertFormError(response, "form", "query", "error at >")
 
-        # create a dynamic group using a query
-        mock_es_data = [
-            {
-                "_type": "_doc",
-                "_index": "dummy_index",
-                "_source": {"id": self.frank.id, "modified_on": self.frank.modified_on.isoformat()},
-            }
-        ]
-        with ESMockWithScroll(data=mock_es_data):
+        # dependent on id
+        with MockParseQuery("id = 123", ["id"], allow_as_group=False):
+            response = self.client.post(url, dict(name="Frank", query="id = 123"))
+            self.assertFormError(
+                response, "form", "query", 'You cannot create a dynamic group based on "id" or "group".'
+            )
+
+        with MockParseQuery('twitter = "hola"', ["twitter"]):
             response = self.client.post(url, dict(name="Frank", query='twitter is "hola"'))
 
         self.assertNoFormErrors(response)
 
         self.dynamic_group.refresh_from_db()
-        self.assertEqual(self.dynamic_group.name, "Frank")
         self.assertEqual(self.dynamic_group.query, 'twitter = "hola"')
-        self.assertEqual(set(self.dynamic_group.contacts.all()), {self.frank})
 
         # mark our dynamic group as evaluating
         self.dynamic_group.status = ContactGroup.STATUS_EVALUATING
         self.dynamic_group.save(update_fields=("status",))
 
         # and check we can't change the query while that is the case
-        response = self.client.post(url, dict(name="Frank", query='twitter = "hello"'))
-        self.assertFormError(response, "form", "query", "You cannot update the query of a group that is evaluating.")
+        with MockParseQuery('twitter = "hello"', ["twitter"]):
+            response = self.client.post(url, dict(name="Frank", query='twitter = "hello"'))
+            self.assertFormError(
+                response, "form", "query", "You cannot update the query of a group that is evaluating."
+            )
 
         # but can change the name
-        response = self.client.post(url, dict(name="Frank2", query='twitter is "hola"'))
-        self.assertNoFormErrors(response)
+        with MockParseQuery('twitter = "hola"', ["twitter"]):
+            response = self.client.post(url, dict(name="Frank2", query='twitter is "hola"'))
+            self.assertNoFormErrors(response)
 
         self.dynamic_group.refresh_from_db()
         self.assertEqual(self.dynamic_group.name, "Frank2")
+
+        # try to update group in other org
+        response = self.client.post(
+            reverse("contacts.contactgroup_update", args=[self.other_org_group.id]), {"name": "new name"}
+        )
+        self.assertLoginRedirect(response)
+
+        # check group is unchanged
+        self.other_org_group.refresh_from_db()
+        self.assertEqual("Customers", self.other_org_group.name)
 
     def test_delete(self):
         url = reverse("contacts.contactgroup_delete", args=[self.joe_and_frank.pk])
@@ -792,6 +972,14 @@ class ContactGroupCRUDLTest(TembaTest):
         self.joe_and_frank.refresh_from_db()
         self.assertFalse(self.joe_and_frank.is_active)
         self.assertFalse(self.joe_and_frank.contacts.all())
+
+        # can't delete group from other org
+        response = self.client.post(reverse("contacts.contactgroup_delete", args=[self.other_org_group.id]))
+        self.assertLoginRedirect(response)
+
+        # check group is unchanged
+        self.other_org_group.refresh_from_db()
+        self.assertTrue(self.other_org_group.is_active)
 
 
 class ContactTest(TembaTest):
@@ -813,6 +1001,9 @@ class ContactTest(TembaTest):
         # create an deleted contact
         self.jim = self.create_contact(name="Jim")
         self.jim.release(self.user)
+
+        # create contact in other org
+        self.other_org_contact = self.create_contact(name="Fred", number="+250768111222", org=self.org2)
 
     def create_campaign(self):
         # create a campaign with a future event and add joe
@@ -846,14 +1037,19 @@ class ContactTest(TembaTest):
             message="Sent 7 days after planting date",
         )
 
+    def test_contact_save_raises_ValueError_if_handle_update_is_not_specified(self):
+        joe = self.create_contact("Joe Blow", "0788123123")
+
+        self.assertRaises(ValueError, joe.save, update_fields=("name",))
+
     def test_get_or_create(self):
 
         # can't create without org
         with self.assertRaises(ValueError):
             Contact.get_or_create(None, "tel:+250781111111", self.channel)
 
-        with self.assertRaises(ValueError):
-            Contact.get_or_create(self.org, "tel:+250781111111", None)
+        contact, urn_obj = Contact.get_or_create(self.org, "tel:+250781111111", None)
+        self.assertEqual(contact.pk, self.joe.pk)
 
         contact, urn_obj = Contact.get_or_create(self.org, "tel:+250781111111", self.channel)
         self.assertEqual(contact.pk, self.joe.pk)
@@ -953,31 +1149,6 @@ class ContactTest(TembaTest):
         )
         self.assertEqual(1, jimmy.urns.all().count())
 
-    def test_get_test_contact(self):
-        test_contact_admin = Contact.get_test_contact(self.admin)
-        self.assertTrue(test_contact_admin.is_test)
-        self.assertEqual(test_contact_admin.created_by, self.admin)
-
-        test_contact_user = Contact.get_test_contact(self.user)
-        self.assertTrue(test_contact_user.is_test)
-        self.assertEqual(test_contact_user.created_by, self.user)
-        self.assertFalse(test_contact_admin == test_contact_user)
-
-        test_contact_user2 = Contact.get_test_contact(self.user)
-        self.assertTrue(test_contact_user2.is_test)
-        self.assertEqual(test_contact_user2.created_by, self.user)
-        self.assertTrue(test_contact_user2 == test_contact_user)
-
-        # assign this URN to another contact
-        other_contact = Contact.get_or_create_by_urns(self.org, self.admin)
-        test_urn = test_contact_user2.get_urn(TEL_SCHEME)
-        test_urn.contact = other_contact
-        test_urn.save()
-
-        # fetching the test contact again should get us a new URN
-        new_test_contact = Contact.get_test_contact(self.user)
-        self.assertNotEqual(new_test_contact.get_urn(TEL_SCHEME), test_urn)
-
     def test_contact_create(self):
         self.login(self.admin)
 
@@ -1031,53 +1202,16 @@ class ContactTest(TembaTest):
         self.assertEqual(Trigger.objects.filter(is_archived=True).count(), 1)
         self.assertEqual(Trigger.objects.filter(is_archived=False).count(), 1)
 
-    def test_contact_send_all(self):
-        contact = self.create_contact("Stephen", "+12078778899", twitter="stephen")
-        Channel.create(self.org, self.user, None, "TT")
-
-        msgs = contact.send("Allo", self.admin, all_urns=True)
-        self.assertEqual(len(msgs), 2)
-        out_msgs = Msg.objects.filter(contact=contact, direction="O")
-        self.assertEqual(out_msgs.count(), 2)
-        self.assertIsNotNone(out_msgs.filter(contact_urn__path="stephen").first())
-        self.assertIsNotNone(out_msgs.filter(contact_urn__path="+12078778899").first())
-
-    @patch("temba.ivr.clients.TwilioClient", MockTwilioClient)
-    @patch("twilio.util.RequestValidator", MockRequestValidator)
-    @override_settings(SEND_CALLS=True)
     def test_release(self):
-
-        # configure our org for ivr
-        self.org.connect_twilio("TEST_SID", "TEST_TOKEN", self.admin)
-        self.org.save()
-        config = {
-            Channel.CONFIG_SEND_URL: "https://api.twilio.com",
-            Channel.CONFIG_ACCOUNT_SID: "TEST_SID",
-            Channel.CONFIG_AUTH_TOKEN: "TEST_TOKEN",
-        }
-
-        Channel.create(self.org, self.org.get_user(), "BR", "TW", "+558299990000", "+558299990000", config, "AC")
-
-        def send(message, contact):
-            msg = Msg.objects.create(
-                org=self.org,
-                direction=INCOMING,
-                contact=contact,
-                contact_urn=contact.get_urn(),
-                text=message,
-                created_on=timezone.now(),
-                modified_on=timezone.now(),
-            )
-            Flow.find_and_handle(msg)
-
-        ivr_flow = self.get_flow("call_me_maybe")
-        msg_flow = self.get_flow("favorites")
-
         # create a contact with a message
         old_contact = self.create_contact("Jose", "+12065552000")
-        send("hola mundo", old_contact)
+        self.create_incoming_msg(old_contact, "hola mundo")
         urn = old_contact.get_urn()
-        ivr_flow.start([], [old_contact])
+
+        ivr_flow = self.get_flow("ivr")
+        msg_flow = self.get_flow("favorites_v13")
+
+        self.create_incoming_call(msg_flow, old_contact)
 
         # steal his urn into a new contact
         contact = self.create_contact("Joe", "tweettweet")
@@ -1086,27 +1220,49 @@ class ContactTest(TembaTest):
         group = self.create_group("Test Group", contacts=[contact])
 
         contact.fields = {"gender": "Male", "age": 40}
-        contact.save(update_fields=("fields",))
+        contact.save(update_fields=("fields",), handle_update=False)
 
-        msg_flow.start([], [contact])
-        broadcast = Broadcast.create(self.org, self.admin, "Test Broadcast", contacts=[contact])
-        broadcast.send()
+        self.create_broadcast(self.admin, "Test Broadcast", contacts=[contact])
 
-        send("red", contact)
-        send("primus", contact)
+        flow_nodes = msg_flow.as_json()["nodes"]
+        color_prompt = flow_nodes[0]
+        color_split = flow_nodes[2]
+        beer_prompt = flow_nodes[3]
+        beer_split = flow_nodes[5]
+        name_prompt = flow_nodes[6]
+        name_split = flow_nodes[7]
 
-        ivr_flow.start([], [contact])
+        (
+            MockSessionWriter(contact, msg_flow)
+            .visit(color_prompt)
+            .send_msg("What is your favorite color?", self.channel)
+            .visit(color_split)
+            .wait()
+            .resume(msg=self.create_incoming_msg(contact, "red"))
+            .visit(beer_prompt)
+            .send_msg("Good choice, I like Red too! What is your favorite beer?", self.channel)
+            .visit(beer_split)
+            .wait()
+            .resume(msg=self.create_incoming_msg(contact, "primus"))
+            .visit(name_prompt)
+            .send_msg("Lastly, what is your name?", self.channel)
+            .visit(name_split)
+            .wait()
+            .save()
+        )
+
+        self.create_incoming_call(msg_flow, contact)
 
         self.assertEqual(1, group.contacts.all().count())
-        self.assertEqual(1, contact.sessions.all().count())
+        self.assertEqual(1, contact.connections.all().count())
         self.assertEqual(1, contact.addressed_broadcasts.all().count())
         self.assertEqual(2, contact.urns.all().count())
         self.assertEqual(2, contact.runs.all().count())
-        self.assertEqual(6, contact.msgs.all().count())
+        self.assertEqual(7, contact.msgs.all().count())
         self.assertEqual(2, len(contact.fields))
 
         # first try a regular release and make sure our urns are anonymized
-        contact.release(self.admin, immediately=False)
+        contact.release(self.admin, full=False)
         self.assertEqual(2, contact.urns.all().count())
         for urn in contact.urns.all():
             uuid.UUID(urn.path, version=4)
@@ -1121,19 +1277,18 @@ class ContactTest(TembaTest):
 
         contact.refresh_from_db()
         self.assertEqual(0, group.contacts.all().count())
-        self.assertEqual(0, contact.sessions.all().count())
+        self.assertEqual(0, contact.connections.all().count())
         self.assertEqual(0, contact.addressed_broadcasts.all().count())
         self.assertEqual(0, contact.urns.all().count())
         self.assertEqual(0, contact.runs.all().count())
         self.assertEqual(0, contact.msgs.all().count())
 
         # contact who used to own our urn had theirs released too
-        self.assertEqual(0, old_contact.sessions.all().count())
+        self.assertEqual(0, old_contact.connections.all().count())
         self.assertEqual(0, old_contact.msgs.all().count())
 
         self.assertIsNone(contact.fields)
         self.assertIsNone(contact.name)
-        self.assertEqual(self.admin, contact.modified_by)
 
         # nope, we aren't paranoid or anything
         Org.objects.get(id=self.org.id)
@@ -1163,18 +1318,16 @@ class ContactTest(TembaTest):
         self.assertEqual(Trigger.objects.filter(is_archived=False).count(), 1)
 
     def test_fail_and_block_and_release(self):
-        msg1 = self.create_msg(text="Test 1", direction="I", contact=self.joe, msg_type="I", status="H")
-        msg2 = self.create_msg(text="Test 2", direction="I", contact=self.joe, msg_type="F", status="H")
-        msg3 = self.create_msg(
-            text="Test 3", direction="I", contact=self.joe, msg_type="I", status="H", visibility="A"
-        )
+        msg1 = self.create_incoming_msg(self.joe, "Test 1", msg_type="I")
+        msg2 = self.create_incoming_msg(self.joe, "Test 2", msg_type="F")
+        msg3 = self.create_incoming_msg(self.joe, "Test 3", msg_type="I", visibility="A")
         label = Label.get_or_create(self.org, self.user, "Interesting")
         label.toggle_label([msg1, msg2, msg3], add=True)
         static_group = self.create_group("Just Joe", [self.joe])
 
         # create a dynamic group and put joe in it
         ContactField.get_or_create(self.org, self.admin, "gender", "Gender")
-        with ESMockWithScroll():
+        with MockParseQuery('gender = "M"', ["gender"]):
             dynamic_group = self.create_group("Dynamic", query="gender is M")
 
         self.joe.set_field(self.admin, "gender", "M")
@@ -1314,18 +1467,13 @@ class ContactTest(TembaTest):
 
         # we don't let users undo releasing a contact... but if we have to do it for some reason
         self.joe.is_active = True
-        self.joe.save(update_fields=("is_active",))
+        self.joe.save(update_fields=("is_active",), handle_update=False)
 
         # check joe goes into the appropriate groups
         contact_counts = ContactGroup.get_system_group_counts(self.org)
         self.assertEqual(
             contact_counts, {ContactGroup.TYPE_ALL: 3, ContactGroup.TYPE_BLOCKED: 1, ContactGroup.TYPE_STOPPED: 1}
         )
-
-        # don't allow blocking or failing of test contacts
-        test_contact = Contact.get_test_contact(self.user)
-        self.assertRaises(ValueError, test_contact.block, self.user)
-        self.assertRaises(ValueError, test_contact.stop, self.user)
 
     def test_user_groups(self):
         # create some static groups
@@ -1336,54 +1484,24 @@ class ContactTest(TembaTest):
         ContactField.get_or_create(self.org, self.admin, "gender", "Gender")
         ContactField.get_or_create(self.org, self.admin, "age", "Age", value_type=Value.TYPE_NUMBER)
 
-        mock_es_data = [
-            {
-                "_type": "_doc",
-                "_index": "dummy_index",
-                "_source": {"id": self.joe.id, "modified_on": self.joe.modified_on.isoformat()},
-            }
-        ]
-        with ESMockWithScroll(data=mock_es_data):
+        with MockParseQuery('twitter != ""', ["twitter"]):
             has_twitter = self.create_group("Has twitter", query='twitter != ""')
 
-        mock_es_data = [
-            {
-                "_type": "_doc",
-                "_index": "dummy_index",
-                "_source": {"id": self.joe.id, "modified_on": self.joe.modified_on.isoformat()},
-            },
-            {
-                "_type": "_doc",
-                "_index": "dummy_index",
-                "_source": {"id": self.frank.id, "modified_on": self.frank.modified_on.isoformat()},
-            },
-            {
-                "_type": "_doc",
-                "_index": "dummy_index",
-                "_source": {"id": self.billy.id, "modified_on": self.billy.modified_on.isoformat()},
-            },
-            {
-                "_type": "_doc",
-                "_index": "dummy_index",
-                "_source": {"id": self.voldemort.id, "modified_on": self.voldemort.modified_on.isoformat()},
-            },
-        ]
-        with ESMockWithScroll(data=mock_es_data):
+        with MockParseQuery('gender = ""', ["gender"]):
             no_gender = self.create_group("No gender", query='gender is ""')
 
-        with ESMockWithScroll():
+        with MockParseQuery('gender = "m" or gender = "male"', ["gender"]):
             males = self.create_group("Male", query="gender is M or gender is Male")
+
+        with MockParseQuery("age > 18 or age < 30", ["age"]):
             youth = self.create_group("Male", query="age > 18 or age < 30")
 
-        mock_es_data = [
-            {
-                "_type": "_doc",
-                "_index": "dummy_index",
-                "_source": {"id": self.joe.id, "modified_on": self.joe.modified_on.isoformat()},
-            }
-        ]
-        with ESMockWithScroll(data=mock_es_data):
+        with MockParseQuery('twitter = "blow80"', ["twitter"]):
             joes = self.create_group("Joes", query='twitter = "blow80"')
+
+        # manually reevaluate all these contacts
+        for c in [self.joe, self.frank, self.billy, self.voldemort]:
+            c.handle_update(is_new=True)
 
         self.assertEqual(set(has_twitter.contacts.all()), {self.joe})
         self.assertEqual(set(no_gender.contacts.all()), {self.joe, self.frank, self.billy, self.voldemort})
@@ -1498,18 +1616,18 @@ class ContactTest(TembaTest):
             self.org, self.admin, "nick", "Nickname", value_type="T", show_in_table=False
         )
 
-        self.joe.set_field(self.user, "age", 32)
+        self.joe.set_field(self.user, "age", "32")
         self.joe.set_field(self.user, "nick", "Joey")
         self.joe = Contact.objects.get(pk=self.joe.pk)
 
         self.billy = Contact.objects.get(pk=self.billy.pk)
 
         all = (self.joe, self.frank, self.billy)
-        Contact.bulk_cache_initialize(self.org, all, for_show_only=True)
+        Contact.bulk_cache_initialize(self.org, all)
 
-        self.assertEqual([u.scheme for u in getattr(self.joe, "__urns")], [TWITTER_SCHEME, TEL_SCHEME])
-        self.assertEqual([u.scheme for u in getattr(self.frank, "__urns")], [TEL_SCHEME])
-        self.assertEqual(getattr(self.billy, "__urns"), list())
+        self.assertEqual([u.scheme for u in getattr(self.joe, "_urns_cache")], [TWITTER_SCHEME, TEL_SCHEME])
+        self.assertEqual([u.scheme for u in getattr(self.frank, "_urns_cache")], [TEL_SCHEME])
+        self.assertEqual(getattr(self.billy, "_urns_cache"), list())
 
         with self.assertNumQueries(0):
             self.assertEqual(self.joe.get_field_value(age), 32)
@@ -1526,7 +1644,37 @@ class ContactTest(TembaTest):
             self.assertIsNone(self.frank.get_field_value(nick))
             self.assertIsNone(self.billy.get_field_value(nick))
 
+    def test_contact_search_evaluation_created_on_utc_rollover(self):
+        # org is in Africa/Kigali timezone: +02:00
+        self.joe.created_on = datetime(2019, 6, 8, 23, 14, 0, tzinfo=pytz.UTC)
+        self.joe.save(update_fields=("created_on",), handle_update=False)
+
+        query_created_on = self.joe.created_on.astimezone(self.org.timezone).date().isoformat()
+
+        # date in org timezone is the 'next' day
+        self.assertEqual(query_created_on, "2019-06-09")
+
+        self.assertTrue(
+            evaluate_query(self.org, f'created_on = "{query_created_on}"', contact_json=self.joe.as_search_json())
+        )
+        query_created_on = (self.joe.created_on - timedelta(days=6)).astimezone(self.org.timezone).date().isoformat()
+        self.assertTrue(
+            evaluate_query(self.org, f'created_on > "{query_created_on}"', contact_json=self.joe.as_search_json())
+        )
+        self.assertTrue(
+            evaluate_query(self.org, f'created_on >= "{query_created_on}"', contact_json=self.joe.as_search_json())
+        )
+        query_created_on = (self.joe.created_on + timedelta(days=6)).astimezone(self.org.timezone).date().isoformat()
+        self.assertTrue(
+            evaluate_query(self.org, f'created_on < "{query_created_on}"', contact_json=self.joe.as_search_json())
+        )
+        self.assertTrue(
+            evaluate_query(self.org, f'created_on <= "{query_created_on}"', contact_json=self.joe.as_search_json())
+        )
+
     def test_contact_search_evaluation(self):
+        self.setUpLocations()
+
         ContactField.get_or_create(self.org, self.admin, "gender", "Gender", value_type=Value.TYPE_TEXT)
         ContactField.get_or_create(self.org, self.admin, "age", "Age", value_type=Value.TYPE_NUMBER)
         ContactField.get_or_create(self.org, self.admin, "joined", "Joined On", value_type=Value.TYPE_DATETIME)
@@ -1534,12 +1682,80 @@ class ContactTest(TembaTest):
         ContactField.get_or_create(self.org, self.admin, "district", "District", value_type=Value.TYPE_DISTRICT)
         ContactField.get_or_create(self.org, self.admin, "state", "State", value_type=Value.TYPE_STATE)
 
-        # evaluator can't be used with Contact attributes (name, id)
+        # test 'name' attribute
+        self.assertTrue(evaluate_query(self.org, 'name = "Joe Blow"', contact_json=self.joe.as_search_json()))
+        self.assertFalse(evaluate_query(self.org, "name = Joe", contact_json=self.joe.as_search_json()))
+        self.assertTrue(evaluate_query(self.org, "name ~ blow", contact_json=self.joe.as_search_json()))
+        self.assertFalse(evaluate_query(self.org, 'name = ""', contact_json=self.joe.as_search_json()))
+        self.assertTrue(evaluate_query(self.org, 'name != ""', contact_json=self.joe.as_search_json()))
+        self.assertTrue(evaluate_query(self.org, 'name != "Bob"', contact_json=self.joe.as_search_json()))
+        self.assertFalse(evaluate_query(self.org, 'name != "Joe Blow"', contact_json=self.joe.as_search_json()))
+        self.assertTrue(evaluate_query(self.org, 'name = ""', contact_json={}))
+        self.assertFalse(evaluate_query(self.org, 'name != ""', contact_json={}))
+        # nothing to compare
+        self.assertFalse(evaluate_query(self.org, "name = Joe", contact_json={}))
+
+        # 'voldemort' does not have any attributes, evaluates to True
+        self.assertTrue(evaluate_query(self.org, 'name != "Joe Blow"', contact_json=self.voldemort.as_search_json()))
+
+        # test 'language' attribute
+        self.joe.language = "eng"
+        self.joe.save(update_fields=("language",), handle_update=False)
+        self.assertTrue(evaluate_query(self.org, 'language = "eng"', contact_json=self.joe.as_search_json()))
+
+        self.assertFalse(evaluate_query(self.org, 'language != "eng"', contact_json=self.joe.as_search_json()))
+        self.assertTrue(evaluate_query(self.org, 'language != "ita"', contact_json=self.joe.as_search_json()))
+
+        self.assertFalse(evaluate_query(self.org, 'language = ""', contact_json=self.joe.as_search_json()))
+        self.assertTrue(evaluate_query(self.org, 'language != ""', contact_json=self.joe.as_search_json()))
+
+        self.assertTrue(evaluate_query(self.org, 'language != "bla"', contact_json=self.voldemort.as_search_json()))
+
+        # language does not support `has` operator
         self.assertRaises(
-            SearchException, evaluate_query, self.org, 'name = "joe Blow"', contact_json=self.joe.as_search_json()
+            SearchException, evaluate_query, self.org, 'language ~ "eng"', contact_json=self.joe.as_search_json()
+        )
+
+        self.joe.language = None
+        self.joe.save(update_fields=("language",), handle_update=False)
+
+        self.assertFalse(evaluate_query(self.org, 'language = "eng"', contact_json=self.joe.as_search_json()))
+
+        self.assertTrue(evaluate_query(self.org, 'language = ""', contact_json=self.joe.as_search_json()))
+        self.assertFalse(evaluate_query(self.org, 'language != ""', contact_json=self.joe.as_search_json()))
+
+        # test 'created_on' attribute
+        self.assertRaises(
+            SearchException,
+            evaluate_query,
+            self.org,
+            'created_on = "this-is-not-a-date"',
+            contact_json=self.joe.as_search_json(),
         )
         self.assertRaises(
-            SearchException, evaluate_query, self.org, 'name != ""', contact_json=self.joe.as_search_json()
+            SearchException,
+            evaluate_query,
+            self.org,
+            'created_on ~ "2016-01-01"',
+            contact_json=self.joe.as_search_json(),
+        )
+        query_created_on = self.joe.created_on.astimezone(self.org.timezone).date().isoformat()
+        self.assertTrue(
+            evaluate_query(self.org, f'created_on = "{query_created_on}"', contact_json=self.joe.as_search_json())
+        )
+        query_created_on = (self.joe.created_on - timedelta(days=6)).astimezone(self.org.timezone).date().isoformat()
+        self.assertTrue(
+            evaluate_query(self.org, f'created_on > "{query_created_on}"', contact_json=self.joe.as_search_json())
+        )
+        self.assertTrue(
+            evaluate_query(self.org, f'created_on >= "{query_created_on}"', contact_json=self.joe.as_search_json())
+        )
+        query_created_on = (self.joe.created_on + timedelta(days=6)).astimezone(self.org.timezone).date().isoformat()
+        self.assertTrue(
+            evaluate_query(self.org, f'created_on < "{query_created_on}"', contact_json=self.joe.as_search_json())
+        )
+        self.assertTrue(
+            evaluate_query(self.org, f'created_on <= "{query_created_on}"', contact_json=self.joe.as_search_json())
         )
 
         # test TEXT field type
@@ -1553,6 +1769,11 @@ class ContactTest(TembaTest):
         self.assertTrue(evaluate_query(self.org, 'gender != ""', contact_json=self.joe.as_search_json()))
         self.assertFalse(evaluate_query(self.org, 'gender = ""', contact_json=self.joe.as_search_json()))
 
+        self.assertTrue(evaluate_query(self.org, "gender != female", contact_json=self.joe.as_search_json()))
+        self.assertFalse(evaluate_query(self.org, "gender != male", contact_json=self.joe.as_search_json()))
+
+        self.assertTrue(evaluate_query(self.org, "gender != female", contact_json=self.voldemort.as_search_json()))
+
         # test DECIMAL field type
         self.assertFalse(evaluate_query(self.org, 'age != ""', contact_json=self.joe.as_search_json()))
         self.assertTrue(evaluate_query(self.org, 'age = ""', contact_json=self.joe.as_search_json()))
@@ -1562,7 +1783,7 @@ class ContactTest(TembaTest):
         self.assertFalse(evaluate_query(self.org, 'age != ""', contact_json=self.joe.as_search_json()))
         self.assertTrue(evaluate_query(self.org, 'age = ""', contact_json=self.joe.as_search_json()))
 
-        self.joe.set_field(self.admin, "age", 18)
+        self.joe.set_field(self.admin, "age", "18")
         self.assertTrue(evaluate_query(self.org, 'age != ""', contact_json=self.joe.as_search_json()))
         self.assertFalse(evaluate_query(self.org, 'age = ""', contact_json=self.joe.as_search_json()))
         self.assertTrue(evaluate_query(self.org, "age = 18", contact_json=self.joe.as_search_json()))
@@ -1617,6 +1838,12 @@ class ContactTest(TembaTest):
         self.assertTrue(evaluate_query(self.org, 'ward != ""', contact_json=self.joe.as_search_json()))
         self.assertFalse(evaluate_query(self.org, 'ward = ""', contact_json=self.joe.as_search_json()))
         self.assertTrue(evaluate_query(self.org, 'ward = "bUKuRE"', contact_json=self.joe.as_search_json()))
+
+        self.assertTrue(evaluate_query(self.org, 'ward != "Rwamagana"', contact_json=self.joe.as_search_json()))
+        self.assertFalse(evaluate_query(self.org, 'ward != "Bukure"', contact_json=self.joe.as_search_json()))
+
+        self.assertTrue(evaluate_query(self.org, 'ward != "Rwamagana"', contact_json=self.voldemort.as_search_json()))
+
         self.assertRaises(
             SearchException, evaluate_query, self.org, 'ward ~ "ukur"', contact_json=self.joe.as_search_json()
         )
@@ -1639,6 +1866,13 @@ class ContactTest(TembaTest):
         self.assertFalse(evaluate_query(self.org, 'district = ""', contact_json=self.joe.as_search_json()))
         self.assertTrue(evaluate_query(self.org, 'district = "Rwamagana"', contact_json=self.joe.as_search_json()))
 
+        self.assertTrue(evaluate_query(self.org, 'district != "Bukure"', contact_json=self.joe.as_search_json()))
+        self.assertFalse(evaluate_query(self.org, 'district != "Rwamagana"', contact_json=self.joe.as_search_json()))
+
+        self.assertTrue(
+            evaluate_query(self.org, 'district != "Rwamagana"', contact_json=self.voldemort.as_search_json())
+        )
+
         self.assertFalse(
             evaluate_query(self.org, 'district = "cedevita is not a district"', contact_json=self.joe.as_search_json())
         )
@@ -1655,6 +1889,18 @@ class ContactTest(TembaTest):
         self.joe.set_field(self.admin, "state", "Rwanda > Eastern Province")
         self.assertTrue(evaluate_query(self.org, 'state != ""', contact_json=self.joe.as_search_json()))
         self.assertFalse(evaluate_query(self.org, 'state = ""', contact_json=self.joe.as_search_json()))
+
+        self.assertTrue(
+            evaluate_query(self.org, 'state != "Western Province"', contact_json=self.joe.as_search_json())
+        )
+        self.assertFalse(
+            evaluate_query(self.org, 'state != "Eastern Province"', contact_json=self.joe.as_search_json())
+        )
+
+        self.assertTrue(
+            evaluate_query(self.org, 'state != "Western Province"', contact_json=self.voldemort.as_search_json())
+        )
+
         self.assertRaises(
             SearchException, evaluate_query, self.org, 'state ~ "stern"', contact_json=self.joe.as_search_json()
         )
@@ -1702,6 +1948,12 @@ class ContactTest(TembaTest):
             )
         )
 
+        # values can contain quotes
+        self.joe.set_field(self.admin, "gender", 'M"F')
+        self.assertTrue(evaluate_query(self.org, r'gender = "M\"F"', contact_json=self.joe.as_search_json()))
+        self.assertFalse(evaluate_query(self.org, r'gender != "M\"F"', contact_json=self.joe.as_search_json()))
+        self.joe.set_field(self.admin, "gender", "male")
+
         # non-existent field or attribute
         self.assertRaises(
             SearchException, evaluate_query, self.org, "credits > 10", contact_json=self.joe.as_search_json()
@@ -1730,6 +1982,7 @@ class ContactTest(TembaTest):
         with AnonymousOrg(self.org):
 
             self.assertTrue(evaluate_query(self.org, "gender = male", contact_json=self.joe.as_search_json()))
+            self.assertTrue(evaluate_query(self.org, "gender != female", contact_json=self.joe.as_search_json()))
             self.assertTrue(evaluate_query(self.org, "age >= 15", contact_json=self.joe.as_search_json()))
 
             # do not evaluate URN queries if org is anonymous
@@ -1749,31 +2002,31 @@ class ContactTest(TembaTest):
 
     def test_contact_search_parsing(self):
         # implicit condition on name
-        self.assertEqual(parse_query("will"), ContactQuery(Condition("name", "~", "will")))
-        self.assertEqual(parse_query("1will2"), ContactQuery(Condition("name", "~", "1will2")))
+        self.assertEqual(legacy_parse_query("will"), ContactQuery(Condition("name", "~", "will")))
+        self.assertEqual(legacy_parse_query("1will2"), ContactQuery(Condition("name", "~", "1will2")))
 
-        self.assertEqual(parse_query("will").as_text(), 'name ~ "will"')
-        self.assertEqual(parse_query("1will2").as_text(), 'name ~ "1will2"')
+        self.assertEqual(legacy_parse_query("will").as_text(), 'name ~ "will"')
+        self.assertEqual(legacy_parse_query("1will2").as_text(), 'name ~ "1will2"')
 
         # implicit condition on tel if value is all tel chars
-        self.assertEqual(parse_query("1234"), ContactQuery(Condition("tel", "~", "1234")))
-        self.assertEqual(parse_query("+12-34"), ContactQuery(Condition("tel", "~", "1234")))
-        self.assertEqual(parse_query("1234", as_anon=True), ContactQuery(Condition("id", "=", "1234")))
-        self.assertEqual(parse_query("+12-34", as_anon=True), ContactQuery(Condition("name", "~", "+12-34")))
-        self.assertEqual(parse_query("bob", as_anon=True), ContactQuery(Condition("name", "~", "bob")))
+        self.assertEqual(legacy_parse_query("1234"), ContactQuery(Condition("tel", "~", "1234")))
+        self.assertEqual(legacy_parse_query("+12-34"), ContactQuery(Condition("tel", "~", "1234")))
+        self.assertEqual(legacy_parse_query("1234", as_anon=True), ContactQuery(Condition("id", "=", "1234")))
+        self.assertEqual(legacy_parse_query("+12-34", as_anon=True), ContactQuery(Condition("name", "~", "+12-34")))
+        self.assertEqual(legacy_parse_query("bob", as_anon=True), ContactQuery(Condition("name", "~", "bob")))
 
-        self.assertEqual(parse_query("1234").as_text(), "tel ~ 1234")
-        self.assertEqual(parse_query("+12-34").as_text(), "tel ~ 1234")
+        self.assertEqual(legacy_parse_query("1234").as_text(), "tel ~ 1234")
+        self.assertEqual(legacy_parse_query("+12-34").as_text(), "tel ~ 1234")
 
         # boolean combinations of implicit conditions
         self.assertEqual(
-            parse_query("will felix", optimize=False),
+            legacy_parse_query("will felix", optimize=False),
             ContactQuery(
                 BoolCombination(BoolCombination.AND, Condition("name", "~", "will"), Condition("name", "~", "felix"))
             ),
         )
         self.assertEqual(
-            parse_query("will felix"),
+            legacy_parse_query("will felix"),
             ContactQuery(
                 SinglePropCombination(
                     "name", BoolCombination.AND, Condition("name", "~", "will"), Condition("name", "~", "felix")
@@ -1781,13 +2034,13 @@ class ContactTest(TembaTest):
             ),
         )
         self.assertEqual(
-            parse_query("will and felix", optimize=False),
+            legacy_parse_query("will and felix", optimize=False),
             ContactQuery(
                 BoolCombination(BoolCombination.AND, Condition("name", "~", "will"), Condition("name", "~", "felix"))
             ),
         )
         self.assertEqual(
-            parse_query("will or felix or matt", optimize=False),
+            legacy_parse_query("will or felix or matt", optimize=False),
             ContactQuery(
                 BoolCombination(
                     BoolCombination.OR,
@@ -1800,22 +2053,23 @@ class ContactTest(TembaTest):
         )
 
         # property conditions
-        self.assertEqual(parse_query("name=will"), ContactQuery(Condition("name", "=", "will")))
-        self.assertEqual(parse_query('name ~ "felix"'), ContactQuery(Condition("name", "~", "felix")))
+        self.assertEqual(legacy_parse_query("name=will"), ContactQuery(Condition("name", "=", "will")))
+        self.assertEqual(legacy_parse_query('name ~ "felix"'), ContactQuery(Condition("name", "~", "felix")))
+        self.assertEqual(legacy_parse_query('name != "felix"'), ContactQuery(Condition("name", "!=", "felix")))
 
         # empty string conditions
-        self.assertEqual(parse_query('name is ""'), ContactQuery(IsSetCondition("name", "is")))
-        self.assertEqual(parse_query('name!=""'), ContactQuery(IsSetCondition("name", "!=")))
+        self.assertEqual(legacy_parse_query('name is ""'), ContactQuery(IsSetCondition("name", "is")))
+        self.assertEqual(legacy_parse_query('name!=""'), ContactQuery(IsSetCondition("name", "!=")))
 
         # boolean combinations of property conditions
         self.assertEqual(
-            parse_query('name=will or name ~ "felix"', optimize=False),
+            legacy_parse_query('name=will or name ~ "felix"', optimize=False),
             ContactQuery(
                 BoolCombination(BoolCombination.OR, Condition("name", "=", "will"), Condition("name", "~", "felix"))
             ),
         )
         self.assertEqual(
-            parse_query('name=will or name ~ "felix"'),
+            legacy_parse_query('name=will or name ~ "felix"'),
             ContactQuery(
                 SinglePropCombination(
                     "name", BoolCombination.OR, Condition("name", "=", "will"), Condition("name", "~", "felix")
@@ -1825,7 +2079,7 @@ class ContactTest(TembaTest):
 
         # mixture of simple and property conditions
         self.assertEqual(
-            parse_query('will or name ~ "felix"'),
+            legacy_parse_query('will or name ~ "felix"'),
             ContactQuery(
                 SinglePropCombination(
                     "name", BoolCombination.OR, Condition("name", "~", "will"), Condition("name", "~", "felix")
@@ -1835,7 +2089,7 @@ class ContactTest(TembaTest):
 
         # optimization will merge conditions combined with the same op
         self.assertEqual(
-            parse_query("will or felix or matt"),
+            legacy_parse_query("will or felix or matt"),
             ContactQuery(
                 SinglePropCombination(
                     "name",
@@ -1849,7 +2103,7 @@ class ContactTest(TembaTest):
 
         # but not conditions combined with different ops
         self.assertEqual(
-            parse_query("will or felix and matt"),
+            legacy_parse_query("will or felix and matt"),
             ContactQuery(
                 BoolCombination(
                     BoolCombination.OR,
@@ -1863,7 +2117,7 @@ class ContactTest(TembaTest):
 
         # optimization respects explicit precedence defined with parentheses
         self.assertEqual(
-            parse_query("(will or felix) and matt"),
+            legacy_parse_query("(will or felix) and matt"),
             ContactQuery(
                 BoolCombination(
                     BoolCombination.AND,
@@ -1876,7 +2130,7 @@ class ContactTest(TembaTest):
         )
 
         # implicit ANDing of conditions
-        query = parse_query('will felix name ~ "matt"')
+        query = legacy_parse_query('will felix name ~ "matt"')
         self.assertEqual(
             query,
             ContactQuery(
@@ -1892,7 +2146,7 @@ class ContactTest(TembaTest):
         self.assertEqual(query.as_text(), 'name ~ "will" AND name ~ "felix" AND name ~ "matt"')
 
         self.assertEqual(
-            parse_query('will felix name ~ "matt"', optimize=False),
+            legacy_parse_query('will felix name ~ "matt"', optimize=False),
             ContactQuery(
                 BoolCombination(
                     BoolCombination.AND,
@@ -1906,7 +2160,7 @@ class ContactTest(TembaTest):
 
         # boolean operator precedence is AND before OR, even when AND is implicit
         self.assertEqual(
-            parse_query("will and felix or matt amber", optimize=False),
+            legacy_parse_query("will and felix or matt amber", optimize=False),
             ContactQuery(
                 BoolCombination(
                     BoolCombination.OR,
@@ -1921,7 +2175,7 @@ class ContactTest(TembaTest):
         )
 
         # boolean combinations can themselves be combined
-        query = parse_query('(Age < 18 and Gender = "male") or (Age > 18 and Gender = "female")')
+        query = legacy_parse_query('(Age < 18 and Gender = "male") or (Age > 18 and Gender = "female")')
         self.assertEqual(
             query,
             ContactQuery(
@@ -1938,789 +2192,55 @@ class ContactTest(TembaTest):
         )
         self.assertEqual(query.as_text(), '(age < 18 AND gender = "male") OR (age > 18 AND gender = "female")')
 
-        self.assertEqual(str(parse_query('Age < 18 and Gender = "male"')), "AND(age<18, gender=male)")
-        self.assertEqual(str(parse_query("Age > 18 and Age < 30")), "AND[age](>18, <30)")
+        self.assertEqual(str(legacy_parse_query('Age < 18 and Gender = "male"')), "AND(age<18, gender=male)")
+        self.assertEqual(str(legacy_parse_query("Age > 18 and Age < 30")), "AND[age](>18, <30)")
 
         # query with UTF-8 characters (non-ascii)
-        query = parse_query('district="Kayônza"')
+        query = legacy_parse_query('district="Kayônza"')
         self.assertEqual(query.as_text(), 'district = "Kayônza"')
 
-    def test_contact_elastic_search(self):
-        gender = ContactField.get_or_create(self.org, self.admin, "gender", "Gender", value_type=Value.TYPE_TEXT)
-        age = ContactField.get_or_create(self.org, self.admin, "age", "Age", value_type=Value.TYPE_NUMBER)
-        joined = ContactField.get_or_create(
-            self.org, self.admin, "joined", "Joined On", value_type=Value.TYPE_DATETIME
-        )
-        ward = ContactField.get_or_create(self.org, self.admin, "ward", "Ward", value_type=Value.TYPE_WARD)
-        district = ContactField.get_or_create(
-            self.org, self.admin, "district", "District", value_type=Value.TYPE_DISTRICT
-        )
-        state = ContactField.get_or_create(self.org, self.admin, "state", "State", value_type=Value.TYPE_STATE)
+        # query that has @ sign
+        query = legacy_parse_query('email ~ "user@example.com"')
+        self.assertEqual(query.as_text(), 'email ~ "user@example.com"')
 
-        base_search = {
-            "query": {
-                "bool": {
-                    "filter": [
-                        # {'term': {'is_blocked': False}},
-                        # {'term': {'is_stopped': False}},
-                        {"term": {"org_id": self.org.id}},
-                        {"term": {"groups": str(self.org.cached_all_contacts_group.uuid)}},
-                    ],
-                    "must": [],
-                }
-            },
-            "sort": [{"id": {"order": "desc"}}],
-        }
+        query = legacy_parse_query("email ~ user@example.com")
+        self.assertEqual(query.as_text(), 'email ~ "user@example.com"')
 
-        # text term matches
-        expected_search = copy.deepcopy(base_search)
-        expected_search["query"]["bool"]["must"] = [
-            {
-                "nested": {
-                    "path": "fields",
-                    "query": {
-                        "bool": {
-                            "must": [
-                                {"term": {"fields.field": str(gender.uuid)}},
-                                {"term": {"fields.text": "unknown"}},
-                            ]
-                        }
-                    },
-                }
-            }
-        ]
-        actual_search, _ = contact_es_search(self.org, 'gender = "unknown"')
-        self.assertEqual(actual_search.to_dict(), expected_search)
-
-        # decimal range matches
-        expected_search = copy.deepcopy(base_search)
-        expected_search["query"]["bool"]["must"] = [
-            {
-                "nested": {
-                    "path": "fields",
-                    "query": {
-                        "bool": {
-                            "must": [{"term": {"fields.field": str(age.uuid)}}, {"match": {"fields.number": "35"}}]
-                        }
-                    },
-                }
-            }
-        ]
-        actual_search, _ = contact_es_search(self.org, "age = 35")
-        self.assertEqual(actual_search.to_dict(), expected_search)
-
-        expected_search = copy.deepcopy(base_search)
-        expected_search["query"]["bool"]["must"] = [
-            {
-                "nested": {
-                    "path": "fields",
-                    "query": {
-                        "bool": {
-                            "must": [
-                                {"term": {"fields.field": str(age.uuid)}},
-                                {"range": {"fields.number": {"gt": "35"}}},
-                            ]
-                        }
-                    },
-                }
-            }
-        ]
-        actual_search, _ = contact_es_search(self.org, "age > 35")
-        self.assertEqual(actual_search.to_dict(), expected_search)
-
-        expected_search = copy.deepcopy(base_search)
-        expected_search["query"]["bool"]["must"] = [
-            {
-                "nested": {
-                    "path": "fields",
-                    "query": {
-                        "bool": {
-                            "must": [
-                                {"term": {"fields.field": str(age.uuid)}},
-                                {"range": {"fields.number": {"gte": "35"}}},
-                            ]
-                        }
-                    },
-                }
-            }
-        ]
-        actual_search, _ = contact_es_search(self.org, "age >= 35")
-        self.assertEqual(actual_search.to_dict(), expected_search)
-
-        expected_search = copy.deepcopy(base_search)
-        expected_search["query"]["bool"]["must"] = [
-            {
-                "nested": {
-                    "path": "fields",
-                    "query": {
-                        "bool": {
-                            "must": [
-                                {"term": {"fields.field": str(age.uuid)}},
-                                {"range": {"fields.number": {"lt": "35"}}},
-                            ]
-                        }
-                    },
-                }
-            }
-        ]
-        actual_search, _ = contact_es_search(self.org, "age < 35")
-        self.assertEqual(actual_search.to_dict(), expected_search)
-
-        expected_search = copy.deepcopy(base_search)
-        expected_search["query"]["bool"]["must"] = [
-            {
-                "nested": {
-                    "path": "fields",
-                    "query": {
-                        "bool": {
-                            "must": [
-                                {"term": {"fields.field": str(age.uuid)}},
-                                {"range": {"fields.number": {"lte": "35"}}},
-                            ]
-                        }
-                    },
-                }
-            }
-        ]
-        actual_search, _ = contact_es_search(self.org, "age <= 35")
-        self.assertEqual(actual_search.to_dict(), expected_search)
-
-        # datetime range matches
-        expected_search = copy.deepcopy(base_search)
-        expected_search["query"]["bool"]["must"] = [
-            {
-                "nested": {
-                    "path": "fields",
-                    "query": {
-                        "bool": {
-                            "must": [
-                                {"term": {"fields.field": str(joined.uuid)}},
-                                {
-                                    "range": {
-                                        "fields.datetime": {
-                                            "gte": "2018-02-28T22:00:00+00:00",
-                                            "lt": "2018-03-01T22:00:00+00:00",
-                                        }
-                                    }
-                                },
-                            ]
-                        }
-                    },
-                }
-            }
-        ]
-        actual_search, _ = contact_es_search(self.org, 'joined = "01-03-2018"')
-        self.assertEqual(actual_search.to_dict(), expected_search)
-
-        expected_search = copy.deepcopy(base_search)
-        expected_search["query"]["bool"]["must"] = [
-            {
-                "nested": {
-                    "path": "fields",
-                    "query": {
-                        "bool": {
-                            "must": [
-                                {"term": {"fields.field": str(joined.uuid)}},
-                                {"range": {"fields.datetime": {"gte": "2018-03-01T22:00:00+00:00"}}},
-                            ]
-                        }
-                    },
-                }
-            }
-        ]
-        actual_search, _ = contact_es_search(self.org, 'joined > "01-03-2018"')
-        self.assertEqual(actual_search.to_dict(), expected_search)
-
-        expected_search = copy.deepcopy(base_search)
-        expected_search["query"]["bool"]["must"] = [
-            {
-                "nested": {
-                    "path": "fields",
-                    "query": {
-                        "bool": {
-                            "must": [
-                                {"term": {"fields.field": str(joined.uuid)}},
-                                {"range": {"fields.datetime": {"gte": "2018-02-28T22:00:00+00:00"}}},
-                            ]
-                        }
-                    },
-                }
-            }
-        ]
-        actual_search, _ = contact_es_search(self.org, 'joined >= "01-03-2018"')
-        self.assertEqual(actual_search.to_dict(), expected_search)
-
-        expected_search = copy.deepcopy(base_search)
-        expected_search["query"]["bool"]["must"] = [
-            {
-                "nested": {
-                    "path": "fields",
-                    "query": {
-                        "bool": {
-                            "must": [
-                                {"term": {"fields.field": str(joined.uuid)}},
-                                {"range": {"fields.datetime": {"lt": "2018-02-28T22:00:00+00:00"}}},
-                            ]
-                        }
-                    },
-                }
-            }
-        ]
-        actual_search, _ = contact_es_search(self.org, 'joined < "01-03-2018"')
-        self.assertEqual(actual_search.to_dict(), expected_search)
-
-        expected_search = copy.deepcopy(base_search)
-        expected_search["query"]["bool"]["must"] = [
-            {
-                "nested": {
-                    "path": "fields",
-                    "query": {
-                        "bool": {
-                            "must": [
-                                {"term": {"fields.field": str(joined.uuid)}},
-                                {"range": {"fields.datetime": {"lt": "2018-03-01T22:00:00+00:00"}}},
-                            ]
-                        }
-                    },
-                }
-            }
-        ]
-        actual_search, _ = contact_es_search(self.org, 'joined <= "01-03-2018"')
-        self.assertEqual(actual_search.to_dict(), expected_search)
-
-        # ward matches
-        expected_search = copy.deepcopy(base_search)
-        expected_search["query"]["bool"]["must"] = [
-            {
-                "nested": {
-                    "path": "fields",
-                    "query": {
-                        "bool": {
-                            "must": [
-                                {"term": {"fields.field": str(ward.uuid)}},
-                                {"term": {"fields.ward_keyword": "bukure"}},
-                            ]
-                        }
-                    },
-                }
-            }
-        ]
-        actual_search, _ = contact_es_search(self.org, 'ward = "Bukure"')
-        self.assertEqual(actual_search.to_dict(), expected_search)
-
-        self.assertRaises(SearchException, contact_es_search, self.org, 'ward ~ "Bukure"')
-
-        # district matches
-        expected_search = copy.deepcopy(base_search)
-        expected_search["query"]["bool"]["must"] = [
-            {
-                "nested": {
-                    "path": "fields",
-                    "query": {
-                        "bool": {
-                            "must": [
-                                {"term": {"fields.field": str(district.uuid)}},
-                                {"term": {"fields.district_keyword": "rwamagana"}},
-                            ]
-                        }
-                    },
-                }
-            }
-        ]
-        actual_search, _ = contact_es_search(self.org, 'district = "Rwamagana"')
-        self.assertEqual(actual_search.to_dict(), expected_search)
-        self.assertRaises(SearchException, contact_es_search, self.org, 'district ~ "Rwamagana"')
-
-        # state matches
-        expected_search = copy.deepcopy(base_search)
-        expected_search["query"]["bool"]["must"] = [
-            {
-                "nested": {
-                    "path": "fields",
-                    "query": {
-                        "bool": {
-                            "must": [
-                                {"term": {"fields.field": str(state.uuid)}},
-                                {"term": {"fields.state_keyword": "eastern province"}},
-                            ]
-                        }
-                    },
-                }
-            }
-        ]
-        actual_search, _ = contact_es_search(self.org, 'state = "Eastern Province"')
-        self.assertEqual(actual_search.to_dict(), expected_search)
-
-        self.assertRaises(SearchException, contact_es_search, self.org, 'state ~ "Eastern Province"')
-
-        expected_search = copy.deepcopy(base_search)
-        expected_search["query"]["bool"]["must"] = [
-            {
-                "nested": {
-                    "path": "fields",
-                    "query": {
-                        "bool": {
-                            "must": [
-                                {"term": {"fields.field": str(gender.uuid)}},
-                                {"term": {"fields.text": "unknown"}},
-                            ]
-                        }
-                    },
-                }
-            },
-            {
-                "nested": {
-                    "path": "fields",
-                    "query": {
-                        "bool": {
-                            "must": [
-                                {"term": {"fields.field": str(age.uuid)}},
-                                {"range": {"fields.number": {"gt": "32"}}},
-                            ]
-                        }
-                    },
-                }
-            },
-        ]
-        actual_search, _ = contact_es_search(self.org, 'gender = "unknown" AND age > 32')
-        self.assertEqual(actual_search.to_dict(), expected_search)
-
-        expected_search = {
-            "query": {
-                "bool": {
-                    "should": [
-                        {
-                            "nested": {
-                                "path": "fields",
-                                "query": {
-                                    "bool": {
-                                        "must": [
-                                            {"term": {"fields.field": str(gender.uuid)}},
-                                            {"term": {"fields.text": "unknown"}},
-                                        ]
-                                    }
-                                },
-                            }
-                        },
-                        {
-                            "nested": {
-                                "path": "fields",
-                                "query": {
-                                    "bool": {
-                                        "must": [
-                                            {"term": {"fields.field": str(joined.uuid)}},
-                                            {"range": {"fields.datetime": {"lt": "2018-02-28T22:00:00+00:00"}}},
-                                        ]
-                                    }
-                                },
-                            }
-                        },
-                    ],
-                    "filter": [
-                        # {'term': {'is_blocked': False}},
-                        # {'term': {'is_stopped': False}},
-                        {"term": {"org_id": self.org.id}},
-                        {"term": {"groups": str(self.org.cached_all_contacts_group.uuid)}},
-                    ],
-                    "minimum_should_match": 1,
-                }
-            },
-            "sort": [{"id": {"order": "desc"}}],
-        }
-
-        actual_search, _ = contact_es_search(self.org, 'gender = "unknown" OR joined < "01-03-2018"')
-        self.assertEqual(actual_search.to_dict(), expected_search)
-
-        expected_search = copy.deepcopy(base_search)
-        expected_search["query"]["bool"]["must"] = [{"term": {"name.keyword": "joe blow"}}]
-        actual_search, _ = contact_es_search(self.org, 'name = "joe Blow"')
-        self.assertEqual(actual_search.to_dict(), expected_search)
-
-        expected_search = copy.deepcopy(base_search)
-        expected_search["query"]["bool"]["must"] = [
-            {
-                "nested": {
-                    "path": "urns",
-                    "query": {
-                        "bool": {
-                            "must": [
-                                {"term": {"urns.scheme": "tel"}},
-                                {"term": {"urns.path.keyword": "+250788382011"}},
-                            ]
-                        }
-                    },
-                }
-            }
-        ]
-        actual_search, _ = contact_es_search(self.org, 'tel = "+250788382011"')
-        self.assertEqual(actual_search.to_dict(), expected_search)
-
-        expected_search = copy.deepcopy(base_search)
-        expected_search["query"]["bool"]["must"] = [
-            {
-                "nested": {
-                    "path": "urns",
-                    "query": {
-                        "bool": {
-                            "must": [{"term": {"urns.scheme": "twitter"}}, {"match_phrase": {"urns.path": "blow"}}]
-                        }
-                    },
-                }
-            }
-        ]
-        actual_search, _ = contact_es_search(self.org, 'twitter ~ "Blow"')
-        self.assertEqual(actual_search.to_dict(), expected_search)
-
-        expected_search = copy.deepcopy(base_search)
-        expected_search["query"]["bool"]["must"] = [
-            {
-                "nested": {
-                    "path": "urns",
-                    "query": {
-                        "bool": {"must": [{"exists": {"field": "urns.path"}}, {"term": {"urns.scheme": "telegram"}}]}
-                    },
-                }
-            }
-        ]
-        actual_search, _ = contact_es_search(self.org, 'telegram != ""')
-        self.assertEqual(actual_search.to_dict(), expected_search)
-
-        # is set not set
-        expected_search = copy.deepcopy(base_search)
-        del expected_search["query"]["bool"]["must"]
-        expected_search["query"]["bool"]["must_not"] = [
-            {
-                "nested": {
-                    "path": "fields",
-                    "query": {
-                        "bool": {
-                            "must": [
-                                {"term": {"fields.field": str(gender.uuid)}},
-                                {"exists": {"field": "fields.text"}},
-                            ]
-                        }
-                    },
-                }
-            }
-        ]
-        actual_search, _ = contact_es_search(self.org, 'gender = ""')
-        self.assertEqual(actual_search.to_dict(), expected_search)
-
-        expected_search = copy.deepcopy(base_search)
-        expected_search["query"]["bool"]["must"] = [
-            {
-                "nested": {
-                    "path": "fields",
-                    "query": {
-                        "bool": {
-                            "must": [
-                                {"term": {"fields.field": str(gender.uuid)}},
-                                {"exists": {"field": "fields.text"}},
-                            ]
-                        }
-                    },
-                }
-            }
-        ]
-        actual_search, _ = contact_es_search(self.org, 'gender != ""')
-        self.assertEqual(actual_search.to_dict(), expected_search)
-
-        expected_search = copy.deepcopy(base_search)
-        del expected_search["query"]["bool"]["must"]
-        expected_search["query"]["bool"]["must_not"] = [
-            {
-                "nested": {
-                    "path": "fields",
-                    "query": {
-                        "bool": {
-                            "must": [{"term": {"fields.field": str(age.uuid)}}, {"exists": {"field": "fields.number"}}]
-                        }
-                    },
-                }
-            }
-        ]
-        actual_search, _ = contact_es_search(self.org, 'age = ""')
-        self.assertEqual(actual_search.to_dict(), expected_search)
-
-        expected_search = copy.deepcopy(base_search)
-        expected_search["query"]["bool"]["must"] = [
-            {
-                "nested": {
-                    "path": "fields",
-                    "query": {
-                        "bool": {
-                            "must": [{"term": {"fields.field": str(age.uuid)}}, {"exists": {"field": "fields.number"}}]
-                        }
-                    },
-                }
-            }
-        ]
-        actual_search, _ = contact_es_search(self.org, 'age != ""')
-        self.assertEqual(actual_search.to_dict(), expected_search)
-
-        expected_search = copy.deepcopy(base_search)
-        del expected_search["query"]["bool"]["must"]
-        expected_search["query"]["bool"]["must_not"] = [
-            {
-                "nested": {
-                    "path": "fields",
-                    "query": {
-                        "bool": {
-                            "must": [
-                                {"term": {"fields.field": str(joined.uuid)}},
-                                {"exists": {"field": "fields.datetime"}},
-                            ]
-                        }
-                    },
-                }
-            }
-        ]
-        actual_search, _ = contact_es_search(self.org, 'joined = ""')
-        self.assertEqual(actual_search.to_dict(), expected_search)
-
-        expected_search = copy.deepcopy(base_search)
-        expected_search["query"]["bool"]["must"] = [
-            {
-                "nested": {
-                    "path": "fields",
-                    "query": {
-                        "bool": {
-                            "must": [
-                                {"term": {"fields.field": str(joined.uuid)}},
-                                {"exists": {"field": "fields.datetime"}},
-                            ]
-                        }
-                    },
-                }
-            }
-        ]
-        actual_search, _ = contact_es_search(self.org, 'joined != ""')
-        self.assertEqual(actual_search.to_dict(), expected_search)
-
-        expected_search = copy.deepcopy(base_search)
-        del expected_search["query"]["bool"]["must"]
-        expected_search["query"]["bool"]["must_not"] = [
-            {
-                "nested": {
-                    "path": "fields",
-                    "query": {
-                        "bool": {
-                            "must": [{"term": {"fields.field": str(ward.uuid)}}, {"exists": {"field": "fields.ward"}}]
-                        }
-                    },
-                }
-            }
-        ]
-        actual_search, _ = contact_es_search(self.org, 'ward = ""')
-        self.assertEqual(actual_search.to_dict(), expected_search)
-
-        expected_search = copy.deepcopy(base_search)
-        expected_search["query"]["bool"]["must"] = [
-            {
-                "nested": {
-                    "path": "fields",
-                    "query": {
-                        "bool": {
-                            "must": [{"term": {"fields.field": str(ward.uuid)}}, {"exists": {"field": "fields.ward"}}]
-                        }
-                    },
-                }
-            }
-        ]
-        actual_search, _ = contact_es_search(self.org, 'ward != ""')
-        self.assertEqual(actual_search.to_dict(), expected_search)
-
-        expected_search = copy.deepcopy(base_search)
-        del expected_search["query"]["bool"]["must"]
-        expected_search["query"]["bool"]["must_not"] = [
-            {
-                "nested": {
-                    "path": "fields",
-                    "query": {
-                        "bool": {
-                            "must": [
-                                {"term": {"fields.field": str(district.uuid)}},
-                                {"exists": {"field": "fields.district"}},
-                            ]
-                        }
-                    },
-                }
-            }
-        ]
-        actual_search, _ = contact_es_search(self.org, 'district = ""')
-        self.assertEqual(actual_search.to_dict(), expected_search)
-
-        expected_search = copy.deepcopy(base_search)
-        expected_search["query"]["bool"]["must"] = [
-            {
-                "nested": {
-                    "path": "fields",
-                    "query": {
-                        "bool": {
-                            "must": [
-                                {"term": {"fields.field": str(district.uuid)}},
-                                {"exists": {"field": "fields.district"}},
-                            ]
-                        }
-                    },
-                }
-            }
-        ]
-        actual_search, _ = contact_es_search(self.org, 'district != ""')
-        self.assertEqual(actual_search.to_dict(), expected_search)
-
-        expected_search = copy.deepcopy(base_search)
-        del expected_search["query"]["bool"]["must"]
-        expected_search["query"]["bool"]["must_not"] = [
-            {
-                "nested": {
-                    "path": "fields",
-                    "query": {
-                        "bool": {
-                            "must": [
-                                {"term": {"fields.field": str(state.uuid)}},
-                                {"exists": {"field": "fields.state"}},
-                            ]
-                        }
-                    },
-                }
-            }
-        ]
-        actual_search, _ = contact_es_search(self.org, 'state = ""')
-        self.assertEqual(actual_search.to_dict(), expected_search)
-
-        expected_search = copy.deepcopy(base_search)
-        expected_search["query"]["bool"]["must"] = [
-            {
-                "nested": {
-                    "path": "fields",
-                    "query": {
-                        "bool": {
-                            "must": [
-                                {"term": {"fields.field": str(state.uuid)}},
-                                {"exists": {"field": "fields.state"}},
-                            ]
-                        }
-                    },
-                }
-            }
-        ]
-        acutal_search, _ = contact_es_search(self.org, 'state != ""')
-        self.assertEqual(acutal_search.to_dict(), expected_search)
-
-        expected_search = copy.deepcopy(base_search)
-        expected_search["query"]["bool"]["must"] = [
-            {
-                "nested": {
-                    "path": "urns",
-                    "query": {
-                        "bool": {"must": [{"exists": {"field": "urns.path"}}, {"term": {"urns.scheme": "tel"}}]}
-                    },
-                }
-            }
-        ]
-        actual_search, _ = contact_es_search(self.org, 'tel != ""')
-        self.assertEqual(actual_search.to_dict(), expected_search)
-
-        expected_search = copy.deepcopy(base_search)
-        del expected_search["query"]["bool"]["must"]
-        expected_search["query"]["bool"]["must_not"] = [
-            {
-                "nested": {
-                    "path": "urns",
-                    "query": {
-                        "bool": {"must": [{"exists": {"field": "urns.path"}}, {"term": {"urns.scheme": "twitter"}}]}
-                    },
-                }
-            }
-        ]
-        actual_search, _ = contact_es_search(self.org, 'twitter = ""')
-        self.assertEqual(actual_search.to_dict(), expected_search)
-
-        expected_search = {
-            "query": {
-                "bool": {
-                    "should": [
-                        {"bool": {"must_not": [{"exists": {"field": "name"}}]}},
-                        {"term": {"name.keyword": ""}},
-                    ],
-                    "filter": [
-                        # {'term': {'is_blocked': False}},
-                        # {'term': {'is_stopped': False}},
-                        {"term": {"org_id": self.org.id}},
-                        {"term": {"groups": str(self.org.cached_all_contacts_group.uuid)}},
-                    ],
-                    "minimum_should_match": 1,
-                }
-            },
-            "sort": [{"id": {"order": "desc"}}],
-        }
-        actual_search, _ = contact_es_search(self.org, 'name = ""')
-        self.assertEqual(actual_search.to_dict(), expected_search)
-
-        expected_search = {
-            "query": {
-                "bool": {
-                    "must_not": [{"term": {"name.keyword": ""}}],
-                    "must": [{"exists": {"field": "name"}}],
-                    "filter": [
-                        # {'term': {'is_blocked': False}},
-                        # {'term': {'is_stopped': False}},
-                        {"term": {"org_id": self.org.id}},
-                        {"term": {"groups": str(self.org.cached_all_contacts_group.uuid)}},
-                    ],
-                }
-            },
-            "sort": [{"id": {"order": "desc"}}],
-        }
-        actual_search, _ = contact_es_search(self.org, 'name != ""')
-        self.assertEqual(actual_search.to_dict(), expected_search)
-
-        with AnonymousOrg(self.org):
-            expected_search = copy.deepcopy(base_search)
-            expected_search["query"]["bool"]["must"] = [{"ids": {"values": ["123"]}}]
-            actual_search, _ = contact_es_search(self.org, "123")
-            self.assertEqual(actual_search.to_dict(), expected_search)
-
-            expected_search = copy.deepcopy(base_search)
-            expected_search["query"]["bool"]["must"] = [{"ids": {"values": [-1]}}]
-            actual_search, _ = contact_es_search(self.org, 'twitter ~ "Blow"')
-            self.assertEqual(actual_search.to_dict(), expected_search)
-
-            expected_search = copy.deepcopy(base_search)
-            expected_search["query"]["bool"]["must"] = [{"ids": {"values": [-1]}}]
-            actual_search, _ = contact_es_search(self.org, 'twitter != ""')
-            self.assertEqual(actual_search.to_dict(), expected_search)
-
-            expected_search = copy.deepcopy(base_search)
-            expected_search["query"]["bool"]["must"] = [{"ids": {"values": [-1]}}]
-            actual_search, _ = contact_es_search(self.org, 'twitter = ""')
-            self.assertEqual(actual_search.to_dict(), expected_search)
-
-            self.assertRaises(SearchException, contact_es_search, self.org, 'id = ""')
+        # escaped quotes
+        query = legacy_parse_query(r'name ~ "O\"Learly"')
+        self.assertEqual(query.as_text(), r'name ~ "O"Learly"')
 
     def test_contact_create_with_dynamicgroup_reevaluation(self):
 
         ContactField.get_or_create(self.org, self.admin, "age", label="Age", value_type=Value.TYPE_NUMBER)
         ContactField.get_or_create(self.org, self.admin, "gender", label="Gender", value_type=Value.TYPE_TEXT)
 
-        with ESMockWithScroll():
+        with MockParseQuery('(age < 18 AND gender = "male") or (age > 18 and gender = "female")', ["age", "gender"]):
             ContactGroup.create_dynamic(
                 self.org,
                 self.admin,
                 "simple group",
                 '(Age < 18 and gender = "male") or (Age > 18 and gender = "female")',
             )
+
+        with MockParseQuery('age > 18 AND gender = "male"', ["age", "gender"]):
             ContactGroup.create_dynamic(self.org, self.admin, "cannon fodder", 'age > 18 and gender = "male"')
+
+        with MockParseQuery('age = ""', ["age"]):
             ContactGroup.create_dynamic(self.org, self.admin, "Empty age field", 'age = ""')
+
+        with MockParseQuery('age != ""', ["age"]):
             ContactGroup.create_dynamic(self.org, self.admin, "Age field is set", 'age != ""')
+
+        with MockParseQuery('twitter = "helio"', ["twitter"]):
             ContactGroup.create_dynamic(self.org, self.admin, "urn group", 'twitter = "helio"')
 
-            with self.assertRaises(SearchException):
+        with self.assertRaises(ValueError):
+            with MockParseQuery(error="age field is invalid"):
                 ContactGroup.create_dynamic(self.org, self.admin, "Age field is invalid", 'age < "age"')
 
         # when creating a new contact we should only reevaluate 'empty age field' and 'urn group' groups
-        with self.assertNumQueries(35):
+        with self.assertNumQueries(32):
             contact = Contact.get_or_create_by_urns(self.org, self.admin, name="Željko", urns=["twitter:helio"])
 
         self.assertCountEqual(
@@ -2730,7 +2250,7 @@ class ContactTest(TembaTest):
 
         # field update works as expected
         contact.set_field(self.user, "gender", "male")
-        contact.set_field(self.user, "age", 20)
+        contact.set_field(self.user, "age", "20")
 
         self.assertCountEqual(
             [group.name for group in contact.user_groups.filter(is_active=True).all()],
@@ -2742,8 +2262,10 @@ class ContactTest(TembaTest):
         self.create_field("gender", "Gender")
         joe_and_frank = self.create_group("Joe and Frank", [self.joe, self.frank])
         nobody = self.create_group("Nobody", [])
-        with ESMockWithScroll():
+
+        with MockParseQuery('gender = "M"', ["gender"]):
             men = self.create_group("Men", query="gender=M")
+            ContactGroup.user_groups.filter(id=men.id).update(status=ContactGroup.STATUS_READY)
 
             # a group which is being re-evaluated and shouldn't appear in any omnibox results
             unready = self.create_group("Group being re-evaluated...", query="gender=M")
@@ -2765,28 +2287,95 @@ class ContactTest(TembaTest):
         self.admin.set_org(self.org)
         self.login(self.admin)
 
-        def omnibox_request(query):
-            response = self.client.get("%s?%s" % (reverse("contacts.contact_omnibox"), query))
+        def omnibox_request(query, version="1"):
+            path = reverse("contacts.contact_omnibox")
+            response = self.client.get(f"{path}?{query}&v={version}")
             return response.json()["results"]
 
-        self.assertEqual(
-            omnibox_request(""),
-            [
+        # search with search string that will raise a SearchException, which we ignore
+        with patch("temba.contacts.omnibox.search_contacts") as sc:
+            sc.side_effect = SearchException("Invalid query")
+            actual_result = omnibox_request("search=-123`213")
+            expected_result = []
+
+            self.assertEqual(actual_result, expected_result)
+
+        with patch("temba.contacts.omnibox.search_contacts") as sc:
+            sc.side_effect = [
+                SearchResults(
+                    query="",
+                    total=4,
+                    fields=[""],
+                    allow_as_group=False,
+                    contact_ids=[self.billy.id, self.frank.id, self.joe.id, self.voldemort.id],
+                ),
+                SearchResults(query="", total=3, fields=[""], allow_as_group=False, contact_ids=[]),
+            ]
+            actual_result = omnibox_request(query="", version="2")
+            expected_result = [
                 # all 3 groups A-Z
-                dict(id="g-%s" % joe_and_frank.uuid, text="Joe and Frank", extra=2),
-                dict(id="g-%s" % men.uuid, text="Men", extra=0),
-                dict(id="g-%s" % nobody.uuid, text="Nobody", extra=0),
+                {"id": joe_and_frank.uuid, "name": "Joe and Frank", "type": "group", "count": 2},
+                {"id": men.uuid, "name": "Men", "type": "group", "count": 0},
+                {"id": nobody.uuid, "name": "Nobody", "type": "group", "count": 0},
                 # all 4 contacts A-Z
-                dict(id="c-%s" % self.billy.uuid, text="Billy Nophone"),
-                dict(id="c-%s" % self.frank.uuid, text="Frank Smith"),
-                dict(id="c-%s" % self.joe.uuid, text="Joe Blow"),
-                dict(id="c-%s" % self.voldemort.uuid, text="250768383383"),
-                # 3 sendable URNs with names as extra
-                dict(id="u-%d" % voldemort_tel.pk, text="250768383383", extra=None, scheme="tel"),
-                dict(id="u-%d" % joe_tel.pk, text="250781111111", extra="Joe Blow", scheme="tel"),
-                dict(id="u-%d" % frank_tel.pk, text="250782222222", extra="Frank Smith", scheme="tel"),
-            ],
-        )
+                {"id": self.billy.uuid, "name": "Billy Nophone", "type": "contact", "urn": ""},
+                {"id": self.frank.uuid, "name": "Frank Smith", "type": "contact", "urn": "250782222222"},
+                {"id": self.joe.uuid, "name": "Joe Blow", "type": "contact", "urn": "blow80"},
+                {"id": self.voldemort.uuid, "name": "250768383383", "type": "contact", "urn": "250768383383"},
+            ]
+
+            self.assertEqual(expected_result, actual_result)
+
+        with patch("temba.contacts.omnibox.search_contacts") as sc:
+            sc.side_effect = [
+                SearchResults(
+                    query="", total=2, fields=[""], allow_as_group=False, contact_ids=[self.billy.id, self.frank.id]
+                ),
+                SearchResults(
+                    query="",
+                    total=2,
+                    fields=[""],
+                    allow_as_group=False,
+                    contact_ids=[self.voldemort.id, self.frank.id],
+                ),
+            ]
+            actual_result = omnibox_request(query="search=250", version="2")
+            expected_result = [
+                # 2 contacts
+                {"id": self.billy.uuid, "name": "Billy Nophone", "type": "contact", "urn": ""},
+                {"id": self.frank.uuid, "name": "Frank Smith", "type": "contact", "urn": "250782222222"},
+                # 2 sendable URNs with contact names
+                {"id": "tel:250768383383", "name": "250768383383", "contact": None, "scheme": "tel", "type": "urn"},
+                {
+                    "id": "tel:250782222222",
+                    "name": "250782222222",
+                    "type": "urn",
+                    "contact": "Frank Smith",
+                    "scheme": "tel",
+                },
+            ]
+            self.assertEqual(expected_result, actual_result)
+
+        with patch("temba.contacts.omnibox.search_contacts") as sc:
+            sc.side_effect = [
+                SearchResults(
+                    query="", total=2, fields=[""], allow_as_group=False, contact_ids=[self.billy.id, self.frank.id]
+                ),
+                SearchResults(query="", total=0, fields=[""], allow_as_group=False, contact_ids=[]),
+            ]
+            with self.assertNumQueries(17):
+                actual_result = omnibox_request(query="")
+                expected_result = [
+                    # all 3 groups A-Z
+                    dict(id="g-%s" % joe_and_frank.uuid, text="Joe and Frank", extra=2),
+                    dict(id="g-%s" % men.uuid, text="Men", extra=0),
+                    dict(id="g-%s" % nobody.uuid, text="Nobody", extra=0),
+                    # 2 contacts A-Z
+                    dict(id="c-%s" % self.billy.uuid, text="Billy Nophone", extra=""),
+                    dict(id="c-%s" % self.frank.uuid, text="Frank Smith", extra="250782222222"),
+                ]
+
+            self.assertEqual(expected_result, actual_result)
 
         # apply type filters...
 
@@ -2809,28 +2398,48 @@ class ContactTest(TembaTest):
             ],
         )
 
-        # c,u = contacts and URNs
-        self.assertEqual(
-            omnibox_request("types=c,u"),
-            [
-                dict(id="c-%s" % self.billy.uuid, text="Billy Nophone"),
-                dict(id="c-%s" % self.frank.uuid, text="Frank Smith"),
-                dict(id="c-%s" % self.joe.uuid, text="Joe Blow"),
-                dict(id="c-%s" % self.voldemort.uuid, text="250768383383"),
-                dict(id="u-%d" % voldemort_tel.pk, text="250768383383", extra=None, scheme="tel"),
-                dict(id="u-%d" % joe_tel.pk, text="250781111111", extra="Joe Blow", scheme="tel"),
-                dict(id="u-%d" % frank_tel.pk, text="250782222222", extra="Frank Smith", scheme="tel"),
-            ],
-        )
+        with patch("temba.contacts.omnibox.search_contacts") as sc:
+            sc.side_effect = [
+                SearchResults(
+                    query="",
+                    total=4,
+                    fields=[""],
+                    allow_as_group=False,
+                    contact_ids=[self.billy.id, self.frank.id, self.joe.id, self.voldemort.id],
+                ),
+                SearchResults(
+                    query="",
+                    total=3,
+                    fields=[""],
+                    allow_as_group=False,
+                    contact_ids=[self.voldemort.id, self.joe.id, self.frank.id],
+                ),
+            ]
+            self.assertEqual(
+                omnibox_request("search=250&types=c,u"),
+                [
+                    dict(id="c-%s" % self.billy.uuid, text="Billy Nophone", extra=""),
+                    dict(id="c-%s" % self.frank.uuid, text="Frank Smith", extra="250782222222"),
+                    dict(id="c-%s" % self.joe.uuid, text="Joe Blow", extra="blow80"),
+                    dict(id="c-%s" % self.voldemort.uuid, text="250768383383", extra="250768383383"),
+                    dict(id="u-%d" % voldemort_tel.pk, text="250768383383", extra=None, scheme="tel"),
+                    dict(id="u-%d" % joe_tel.pk, text="250781111111", extra="Joe Blow", scheme="tel"),
+                    dict(id="u-%d" % frank_tel.pk, text="250782222222", extra="Frank Smith", scheme="tel"),
+                ],
+            )
 
         # search for Frank by phone
-        self.assertEqual(
-            omnibox_request("search=222"),
-            [dict(id="u-%d" % frank_tel.pk, text="250782222222", extra="Frank Smith", scheme="tel")],
-        )
-
-        # search for Joe by twitter - won't return anything because there is no twitter channel
-        self.assertEqual(omnibox_request("search=blow80"), [])
+        with patch("temba.contacts.omnibox.search_contacts") as sc:
+            sc.side_effect = [
+                SearchResults(query="name ~ 222", total=0, fields=[""], allow_as_group=True, contact_ids=[]),
+                SearchResults(
+                    query="urn ~ 222", total=1, fields=[""], allow_as_group=True, contact_ids=[self.frank.id]
+                ),
+            ]
+            self.assertEqual(
+                omnibox_request("search=222"),
+                [dict(id="u-%d" % frank_tel.pk, text="250782222222", extra="Frank Smith", scheme="tel")],
+            )
 
         # create twitter channel
         Channel.create(self.org, self.user, None, "TT")
@@ -2838,33 +2447,24 @@ class ContactTest(TembaTest):
         # add add an external channel so numbers get normalized
         Channel.create(self.org, self.user, "RW", "EX", schemes=[TEL_SCHEME])
 
-        # search for again for Joe by twitter
-        self.assertEqual(
-            omnibox_request("search=blow80"),
-            [dict(id="u-%d" % joe_twitter.pk, text="blow80", extra="Joe Blow", scheme="twitter")],
-        )
-
-        # search for Joe again - match on last name and twitter handle
-        self.assertEqual(
-            omnibox_request("search=BLOW"),
-            [
-                dict(id="c-%s" % self.joe.uuid, text="Joe Blow"),
-                dict(id="u-%d" % joe_twitter.pk, text="blow80", extra="Joe Blow", scheme="twitter"),
-            ],
-        )
-
-        # make sure our matches are ANDed
-        self.assertEqual(omnibox_request("search=Joe+o&types=c"), [dict(id="c-%s" % self.joe.uuid, text="Joe Blow")])
-        self.assertEqual(
-            omnibox_request("search=Joe+o&types=g"),
-            [dict(id="g-%s" % joe_and_frank.uuid, text="Joe and Frank", extra=2)],
-        )
-
-        # lookup by contact ids
-        self.assertEqual(
-            omnibox_request("c=%s,%s" % (self.joe.uuid, self.frank.uuid)),
-            [dict(id="c-%s" % self.frank.uuid, text="Frank Smith"), dict(id="c-%s" % self.joe.uuid, text="Joe Blow")],
-        )
+        # search for Joe - match on last name and twitter handle
+        with patch("temba.contacts.omnibox.search_contacts") as sc:
+            sc.side_effect = [
+                SearchResults(
+                    query="name ~ blow", total=1, fields=[""], allow_as_group=True, contact_ids=[self.joe.id]
+                ),
+                SearchResults(
+                    query="urn ~ blow", total=1, fields=[""], allow_as_group=True, contact_ids=[self.joe.id]
+                ),
+            ]
+            self.assertEqual(
+                omnibox_request("search=BLOW"),
+                [
+                    dict(id="c-%s" % self.joe.uuid, text="Joe Blow", extra="blow80"),
+                    dict(id="u-%d" % joe_tel.pk, text="0781 111 111", extra="Joe Blow", scheme="tel"),
+                    dict(id="u-%d" % joe_twitter.pk, text="blow80", extra="Joe Blow", scheme="twitter"),
+                ],
+            )
 
         # lookup by group id
         self.assertEqual(
@@ -2883,39 +2483,54 @@ class ContactTest(TembaTest):
         )
 
         # lookup by message ids
-        msg = self.create_msg(direction="I", contact=self.joe, text="some message")
-        self.assertEqual(omnibox_request("m=%d" % msg.pk), [dict(id="c-%s" % self.joe.uuid, text="Joe Blow")])
+        msg = self.create_incoming_msg(self.joe, "some message")
+        self.assertEqual(
+            omnibox_request("m=%d" % msg.pk), [dict(id="c-%s" % self.joe.uuid, text="Joe Blow", extra="blow80")]
+        )
 
         # lookup by label ids
         label = Label.get_or_create(self.org, self.user, "msg label")
         self.assertEqual(omnibox_request("l=%d" % label.pk), [])
 
         msg.labels.add(label)
-        self.assertEqual(omnibox_request("l=%d" % label.pk), [dict(id="c-%s" % self.joe.uuid, text="Joe Blow")])
+        self.assertEqual(
+            omnibox_request("l=%d" % label.pk), [dict(id="c-%s" % self.joe.uuid, text="Joe Blow", extra="blow80")]
+        )
 
         with AnonymousOrg(self.org):
-            self.assertEqual(
-                omnibox_request(""),
-                [
-                    # all 3 groups...
-                    dict(id="g-%s" % joe_and_frank.uuid, text="Joe and Frank", extra=2),
-                    dict(id="g-%s" % men.uuid, text="Men", extra=0),
-                    dict(id="g-%s" % nobody.uuid, text="Nobody", extra=0),
-                    # all 4 contacts A-Z
-                    dict(id="c-%s" % self.billy.uuid, text="Billy Nophone"),
-                    dict(id="c-%s" % self.frank.uuid, text="Frank Smith"),
-                    dict(id="c-%s" % self.joe.uuid, text="Joe Blow"),
-                    dict(id="c-%s" % self.voldemort.uuid, text=self.voldemort.anon_identifier),
-                ],
-            )
+            with patch("temba.contacts.omnibox.search_contacts") as sc:
+                sc.side_effect = [
+                    SearchResults(query="", total=1, fields=[""], allow_as_group=False, contact_ids=[self.billy.id])
+                ]
+                self.assertEqual(
+                    omnibox_request(""),
+                    [
+                        # all 3 groups...
+                        dict(id="g-%s" % joe_and_frank.uuid, text="Joe and Frank", extra=2),
+                        dict(id="g-%s" % men.uuid, text="Men", extra=0),
+                        dict(id="g-%s" % nobody.uuid, text="Nobody", extra=0),
+                        # 1 contact
+                        dict(id="c-%s" % self.billy.uuid, text="Billy Nophone"),
+                        # no urns
+                    ],
+                )
 
-            # can search by frank id
-            self.assertEqual(
-                omnibox_request("search=%d" % self.frank.pk), [dict(id="c-%s" % self.frank.uuid, text="Frank Smith")]
-            )
-
-            # but not by frank number
-            self.assertEqual(omnibox_request("search=222"), [])
+            # same search but with v2 format
+            with patch("temba.contacts.omnibox.search_contacts") as sc:
+                sc.side_effect = [
+                    SearchResults(query="", total=1, fields=[""], allow_as_group=False, contact_ids=[self.billy.id])
+                ]
+                self.assertEqual(
+                    omnibox_request("", version="2"),
+                    [
+                        # all 3 groups A-Z
+                        {"id": joe_and_frank.uuid, "name": "Joe and Frank", "type": "group", "count": 2},
+                        {"id": men.uuid, "name": "Men", "type": "group", "count": 0},
+                        {"id": nobody.uuid, "name": "Nobody", "type": "group", "count": 0},
+                        # 1 contact
+                        {"id": self.billy.uuid, "name": "Billy Nophone", "type": "contact"},
+                    ],
+                )
 
         # exclude blocked and stopped contacts
         self.joe.block(self.admin)
@@ -2942,15 +2557,14 @@ class ContactTest(TembaTest):
 
             kurt = self.create_contact("Kurt", "123123")
             self.joe.created_on = timezone.now() - timedelta(days=1000)
-            self.joe.save(update_fields=("created_on",))
+            self.joe.save(update_fields=("created_on",), handle_update=False)
 
             self.create_campaign()
 
             # add a message with some attachments
-            self.create_msg(
-                direction="I",
-                contact=self.joe,
-                text="Message caption",
+            self.create_incoming_msg(
+                self.joe,
+                "Message caption",
                 created_on=timezone.now(),
                 attachments=[
                     "audio/mp3:http://blah/file.mp3",
@@ -2960,37 +2574,57 @@ class ContactTest(TembaTest):
             )
 
             # create some messages
-            for i in range(99):
-                self.create_msg(
-                    direction="I",
-                    contact=self.joe,
-                    text="Inbound message %d" % i,
-                    created_on=timezone.now() - timedelta(days=(100 - i)),
+            for i in range(95):
+                self.create_incoming_msg(
+                    self.joe, "Inbound message %d" % i, created_on=timezone.now() - timedelta(days=(100 - i))
                 )
 
             # because messages are stored with timestamps from external systems, possible to have initial message
             # which is little bit older than the contact itself
-            self.create_msg(
-                direction="I",
-                contact=self.joe,
-                text="Very old inbound message",
-                created_on=self.joe.created_on - timedelta(seconds=10),
+            self.create_incoming_msg(
+                self.joe, "Very old inbound message", created_on=self.joe.created_on - timedelta(seconds=10)
             )
 
-            # start a joe flow
-            self.reminder_flow.start([], [self.joe, kurt])
+            flow = self.get_flow("color_v13")
+            nodes = flow.as_json()["nodes"]
+            color_prompt = nodes[0]
+            color_split = nodes[4]
+
+            (
+                MockSessionWriter(self.joe, flow)
+                .visit(color_prompt)
+                .send_msg("What is your favorite color?", self.channel)
+                .call_webhook("POST", "https://example.com/", "1234")  # pretend that flow run made a webhook request
+                .visit(color_split)
+                .set_result("Color", "green", "Green", "I like green")
+                .wait()
+                .save()
+            )
+            (
+                MockSessionWriter(kurt, flow)
+                .visit(color_prompt)
+                .send_msg("What is your favorite color?", self.channel)
+                .visit(color_split)
+                .wait()
+                .save()
+            )
 
             # mark an outgoing message as failed
             failed = Msg.objects.get(direction="O", contact=self.joe)
             failed.status = "F"
-            failed.save()
+            failed.save(update_fields=("status",))
             log = ChannelLog.objects.create(
                 channel=failed.channel, msg=failed, is_error=True, description="It didn't send!!"
             )
 
-            # pretend that flow run made a webhook request
-            WebHookEvent.trigger_flow_webhook(
-                FlowRun.objects.get(contact=self.joe), "https://example.com", "1234", msg=None
+            # create an airtime transfer
+            AirtimeTransfer.objects.create(
+                org=self.org,
+                status="S",
+                contact=self.joe,
+                currency="RWF",
+                desired_amount=Decimal("100"),
+                actual_amount=Decimal("100"),
             )
 
             # create an event from the past
@@ -2999,40 +2633,61 @@ class ContactTest(TembaTest):
                 event=self.planting_reminder, contact=self.joe, scheduled=scheduled, fired=scheduled
             )
 
-            # create a missed call
+            # create missed incoming and outgoing calls
             ChannelEvent.create(
                 self.channel, str(self.joe.get_urn(TEL_SCHEME)), ChannelEvent.TYPE_CALL_OUT_MISSED, timezone.now(), {}
             )
+            ChannelEvent.create(
+                self.channel, str(self.joe.get_urn(TEL_SCHEME)), ChannelEvent.TYPE_CALL_IN_MISSED, timezone.now(), {}
+            )
+
+            # and a referral event
+            ChannelEvent.create(
+                self.channel, str(self.joe.get_urn(TEL_SCHEME)), ChannelEvent.TYPE_NEW_CONVERSATION, timezone.now(), {}
+            )
 
             # try adding some failed calls
-            IVRCall.objects.create(
+            call = IVRCall.objects.create(
                 contact=self.joe,
                 status=IVRCall.NO_ANSWER,
-                created_by=self.admin,
-                modified_by=self.admin,
                 channel=self.channel,
                 org=self.org,
                 contact_urn=self.joe.urns.all().first(),
             )
 
+            # create a channel log for this call
+            ChannelLog.objects.create(
+                channel=self.channel, description="Its an ivr call", is_error=False, connection=call
+            )
+
             # fetch our contact history
-            with self.assertNumQueries(70):
+            with self.assertNumQueries(69):
                 response = self.fetch_protected(url, self.admin)
 
             # activity should include all messages in the last 90 days, the channel event, the call, and the flow run
-            activity = response.context["activity"]
-            self.assertEqual(len(activity), 95)
-            self.assertIsInstance(activity[0]["obj"], IVRCall)
-            self.assertIsInstance(activity[1]["obj"], ChannelEvent)
-            self.assertIsInstance(activity[2]["obj"], WebHookResult)
-            self.assertIsInstance(activity[3]["obj"], Msg)
-            self.assertEqual(activity[3]["obj"].direction, "O")
-            self.assertIsInstance(activity[4]["obj"], FlowRun)
-            self.assertIsInstance(activity[5]["obj"], Msg)
-            self.assertIsInstance(activity[6]["obj"], Msg)
-            self.assertEqual(activity[6]["obj"].text, "Inbound message 98")
-            self.assertIsInstance(activity[9]["obj"], EventFire)
-            self.assertEqual(activity[-1]["obj"].text, "Inbound message 11")
+            history = response.context["history"]
+            self.assertEqual(95, len(history))
+
+            def assertHistoryEvent(item, expected_type, obj_class=None, msg_text=None):
+                self.assertEqual(expected_type, item["type"])
+                self.assertIsInstance(item["created_on"], datetime)
+                if obj_class:
+                    self.assertIsInstance(item["obj"], obj_class)
+                if msg_text:
+                    self.assertEqual(msg_text, item["obj"].text)
+
+            assertHistoryEvent(history[0], "call_started", IVRCall)
+            assertHistoryEvent(history[1], "channel_event", ChannelEvent)
+            assertHistoryEvent(history[2], "channel_event", ChannelEvent)
+            assertHistoryEvent(history[3], "channel_event", ChannelEvent)
+            assertHistoryEvent(history[4], "airtime_transferred", AirtimeTransfer)
+            assertHistoryEvent(history[5], "webhook_called", WebHookResult)
+            assertHistoryEvent(history[6], "run_result_changed")
+            assertHistoryEvent(history[7], "msg_created", Msg)
+            assertHistoryEvent(history[8], "flow_entered", FlowRun)
+            assertHistoryEvent(history[9], "msg_received", Msg)
+            assertHistoryEvent(history[10], "campaign_fired", EventFire)
+            assertHistoryEvent(history[-1], "msg_received", Msg, msg_text="Inbound message 11")
 
             self.assertContains(response, "<audio ")
             self.assertContains(response, '<source type="audio/mp3" src="http://blah/file.mp3" />')
@@ -3042,7 +2697,8 @@ class ContactTest(TembaTest):
                 response,
                 "http://www.openstreetmap.org/?mlat=47.5414799&amp;mlon=-122.6359908#map=18/47.5414799/-122.6359908",
             )
-            self.assertContains(response, "/channels/channellog/read/%d/" % log.id)
+            self.assertContains(response, reverse("channels.channellog_read", args=[log.id]))
+            self.assertContains(response, reverse("channels.channellog_connection", args=[call.id]))
 
             # fetch next page
             before = datetime_to_ms(timezone.now() - timedelta(days=90))
@@ -3053,61 +2709,36 @@ class ContactTest(TembaTest):
             self.assertNotContains(response, "icon-bubble-notification")
 
             # activity should include 11 remaining messages and the event fire
-            activity = response.context["activity"]
-            self.assertEqual(len(activity), 12)
-            self.assertEqual(activity[0]["obj"].text, "Inbound message 10")
-            self.assertEqual(activity[10]["obj"].text, "Inbound message 0")
-            self.assertEqual(activity[11]["obj"].text, "Very old inbound message")
-
-            # make our broadcast look like an old purged broadcast
-            bcast = Broadcast.objects.get()
-            for msg in bcast.msgs.all():
-                BroadcastRecipient.objects.create(contact=msg.contact, broadcast=bcast, purged_status=msg.status)
-
-            bcast.purged = True
-            bcast.save(update_fields=("purged",))
-            self.release(bcast.msgs.all(), delete=True)
-
-            recipient = BroadcastRecipient.objects.filter(contact=self.joe, broadcast=bcast).first()
-            recipient.purged_status = "F"
-            recipient.save()
+            history = response.context["history"]
+            self.assertEqual(12, len(history))
+            assertHistoryEvent(history[0], "msg_received", Msg, msg_text="Inbound message 10")
+            assertHistoryEvent(history[10], "msg_received", Msg, msg_text="Inbound message 0")
+            assertHistoryEvent(history[11], "msg_received", Msg, msg_text="Very old inbound message")
 
             response = self.fetch_protected(url, self.admin)
-            activity = response.context["activity"]
+            history = response.context["history"]
 
-            # our broadcast recipient purged_status is failed
-            self.assertContains(response, "icon-bubble-notification")
-
-            self.assertEqual(len(activity), 95)
-            self.assertIsInstance(
-                activity[4]["obj"], Broadcast
-            )  # TODO fix order so initial broadcasts come after their run
-            self.assertEqual(
-                activity[4]["obj"].text,
-                {"base": "What is your favorite color?", "fra": "Quelle est votre couleur préférée?"},
-            )
-            self.assertEqual(activity[4]["obj"].translated_text, "What is your favorite color?")
+            self.assertEqual(95, len(history))
+            assertHistoryEvent(history[7], "msg_created", Msg, msg_text="What is your favorite color?")
 
             # if a new message comes in
-            self.create_msg(direction="I", contact=self.joe, text="Newer message")
+            self.create_incoming_msg(self.joe, "Newer message")
             response = self.fetch_protected(url, self.admin)
 
             # now we'll see the message that just came in first, followed by the call event
-            activity = response.context["activity"]
-            self.assertIsInstance(activity[0]["obj"], Msg)
-            self.assertEqual(activity[0]["obj"].text, "Newer message")
-            self.assertIsInstance(activity[1]["obj"], IVRCall)
+            history = response.context["history"]
+            assertHistoryEvent(history[0], "msg_received", Msg, msg_text="Newer message")
+            assertHistoryEvent(history[1], "call_started", IVRCall)
 
             recent_start = datetime_to_ms(timezone.now() - timedelta(days=1))
             response = self.fetch_protected(url + "?after=%s" % recent_start, self.admin)
 
             # with our recent flag on, should not see the older messages
-            activity = response.context["activity"]
-            self.assertEqual(len(activity), 7)
+            history = response.context["history"]
+            self.assertEqual(11, len(history))
             self.assertContains(response, "file.mp4")
 
             # can't view history of contact in another org
-            self.create_secondary_org()
             hans = self.create_contact("Hans", twitter="hans", org=self.org2)
             response = self.client.get(reverse("contacts.contact_history", args=[hans.uuid]))
             self.assertLoginRedirect(response)
@@ -3118,36 +2749,43 @@ class ContactTest(TembaTest):
 
             # super users can view history of any contact
             response = self.fetch_protected(reverse("contacts.contact_history", args=[self.joe.uuid]), self.superuser)
-            self.assertEqual(len(response.context["activity"]), 96)
-            response = self.fetch_protected(reverse("contacts.contact_history", args=[hans.uuid]), self.superuser)
-            self.assertEqual(len(response.context["activity"]), 0)
+            self.assertEqual(96, len(response.context["history"]))
 
-            # exit flow runs
-            FlowRun.bulk_exit(self.joe.runs.all(), FlowRun.EXIT_TYPE_COMPLETED)
+            response = self.fetch_protected(reverse("contacts.contact_history", args=[hans.uuid]), self.superuser)
+            self.assertEqual(0, len(response.context["history"]))
 
             # add a new run
-            self.reminder_flow.start([], [self.joe], restart_participants=True)
+            (
+                MockSessionWriter(self.joe, flow)
+                .visit(color_prompt)
+                .send_msg("What is your favorite color?", self.channel)
+                .visit(color_split)
+                .wait()
+                .save()
+            )
+
             response = self.fetch_protected(reverse("contacts.contact_history", args=[self.joe.uuid]), self.admin)
-            activity = response.context["activity"]
-            self.assertEqual(len(activity), 99)
+            history = response.context["history"]
+            self.assertEqual(99, len(history))
 
             # before date should not match our last activity, that only happens when we truncate
-            self.assertNotEqual(response.context["before"], datetime_to_ms(response.context["activity"][-1]["time"]))
+            self.assertNotEqual(
+                response.context["before"], datetime_to_ms(response.context["history"][-1]["created_on"])
+            )
 
-            self.assertIsInstance(activity[0]["obj"], Msg)
-            self.assertEqual(activity[0]["obj"].direction, "O")
-            self.assertEqual(activity[1]["type"], "run-start")
-            self.assertIsInstance(activity[1]["obj"], FlowRun)
-            self.assertEqual(activity[1]["obj"].exit_type, None)
-            self.assertEqual(activity[2]["type"], "run-exit")
-            self.assertIsInstance(activity[2]["obj"], FlowRun)
-            self.assertEqual(activity[2]["obj"].exit_type, FlowRun.EXIT_TYPE_COMPLETED)
-            self.assertIsInstance(activity[3]["obj"], Msg)
-            self.assertEqual(activity[3]["obj"].direction, "I")
-            self.assertIsInstance(activity[4]["obj"], IVRCall)
-            self.assertIsInstance(activity[5]["obj"], ChannelEvent)
-            self.assertIsInstance(activity[6]["obj"], WebHookResult)
-            self.assertIsInstance(activity[7]["obj"], FlowRun)
+            assertHistoryEvent(history[0], "msg_created", Msg, msg_text="What is your favorite color?")
+            assertHistoryEvent(history[1], "flow_entered", FlowRun)
+            assertHistoryEvent(history[2], "flow_exited", FlowRun)
+            assertHistoryEvent(history[3], "msg_received", Msg, msg_text="Newer message")
+            assertHistoryEvent(history[4], "call_started", IVRCall)
+            assertHistoryEvent(history[5], "channel_event", ChannelEvent)
+            assertHistoryEvent(history[6], "channel_event", ChannelEvent)
+            assertHistoryEvent(history[7], "channel_event", ChannelEvent)
+            assertHistoryEvent(history[8], "airtime_transferred", AirtimeTransfer)
+            assertHistoryEvent(history[9], "webhook_called", WebHookResult)
+            assertHistoryEvent(history[10], "run_result_changed")
+            assertHistoryEvent(history[11], "msg_created", Msg, msg_text="What is your favorite color?")
+            assertHistoryEvent(history[12], "flow_entered", FlowRun)
 
         # with a max history of one, we should see this event first
         with patch("temba.contacts.models.MAX_HISTORY", 1):
@@ -3165,7 +2803,7 @@ class ContactTest(TembaTest):
                 + "?before=%d" % datetime_to_ms(scheduled + timedelta(minutes=5)),
                 self.admin,
             )
-            self.assertEqual(self.message_event, response.context["activity"][0]["obj"].event)
+            self.assertEqual(self.message_event, response.context["history"][0]["obj"].event)
 
         # now try the proper max history to test truncation
         response = self.fetch_protected(
@@ -3174,22 +2812,69 @@ class ContactTest(TembaTest):
         )
 
         # our before should be the same as the last item
-        last_item_date = datetime_to_ms(response.context["activity"][-1]["time"])
+        last_item_date = datetime_to_ms(response.context["history"][-1]["created_on"])
         self.assertEqual(response.context["before"], last_item_date)
 
         # and our after should be 90 days earlier
         self.assertEqual(response.context["after"], last_item_date - (90 * 24 * 60 * 60 * 1000))
-        self.assertEqual(len(response.context["activity"]), 50)
+        self.assertEqual(50, len(response.context["history"]))
 
         # and we should have a marker for older items
         self.assertTrue(response.context["has_older"])
 
-    def test_event_times(self):
+        # can't view history of contact in other org
+        response = self.client.get(reverse("contacts.contact_history", args=[self.other_org_contact.uuid]))
+        self.assertLoginRedirect(response)
+
+    def test_history_session_events(self):
+        flow = self.get_flow("color_v13")
+        nodes = flow.as_json()["nodes"]
+        (
+            MockSessionWriter(self.joe, flow)
+            .visit(nodes[0])
+            .add_contact_urn("twitter", "joey")
+            .set_contact_field("gender", "Gender", "M")
+            .set_contact_field("age", "Age", "")
+            .set_contact_language("spa")
+            .set_contact_language("")
+            .set_contact_name("Joe")
+            .set_contact_name("")
+            .set_result("Color", "red", "Red", "it's red")
+            .send_email(["joe@nyaruka.com"], "Test", "Hello there Joe")
+            .error("unable to send email")
+            .fail("this is a failure")
+            .save()
+        )
+
+        url = reverse("contacts.contact_history", args=[self.joe.uuid])
+        self.login(self.user)
+
+        response = self.client.get(url)
+        self.assertEqual(200, response.status_code)
+        self.assertContains(response, "URNs updated to")
+        self.assertContains(response, "<b>blow80</b>, ")
+        self.assertContains(response, "<b>+250 781 111 111</b>, and ")
+        self.assertContains(response, "<b>joey</b>")
+        self.assertContains(response, "Field <b>Gender</b> updated to <b>M</b>")
+        self.assertContains(response, "Field <b>Age</b> cleared")
+        self.assertContains(response, "Language updated to <b>spa</b>")
+        self.assertContains(response, "Language cleared")
+        self.assertContains(response, "Name updated to <b>Joe</b>")
+        self.assertContains(response, "Name cleared")
+        self.assertContains(response, "Run result <b>Color</b> updated to <b>red</b> with category <b>Red</b>")
+        self.assertContains(
+            response,
+            "Email sent to\n        \n          <b>joe@nyaruka.com</b>\n        \n        with subject\n        <b>Test</b>",
+        )
+        self.assertContains(response, "unable to send email")
+        self.assertContains(response, "this is a failure")
+
+    def test_campaign_event_time(self):
 
         self.create_campaign()
 
         from temba.campaigns.models import CampaignEvent
-        from temba.contacts.templatetags.contacts import event_time
+        from temba.contacts.templatetags.contacts import campaign_event_time
 
         event = CampaignEvent.create_message_event(
             self.org,
@@ -3202,106 +2887,154 @@ class ContactTest(TembaTest):
         )
 
         event.unit = "D"
-        self.assertEqual("7 days after Planting Date", event_time(event))
+        self.assertEqual("7 days after Planting Date", campaign_event_time(event))
 
         event.unit = "M"
-        self.assertEqual("7 minutes after Planting Date", event_time(event))
+        self.assertEqual("7 minutes after Planting Date", campaign_event_time(event))
 
         event.unit = "H"
-        self.assertEqual("7 hours after Planting Date", event_time(event))
+        self.assertEqual("7 hours after Planting Date", campaign_event_time(event))
 
         event.offset = -1
-        self.assertEqual("1 hour before Planting Date", event_time(event))
+        self.assertEqual("1 hour before Planting Date", campaign_event_time(event))
 
         event.unit = "D"
-        self.assertEqual("1 day before Planting Date", event_time(event))
+        self.assertEqual("1 day before Planting Date", campaign_event_time(event))
 
         event.unit = "M"
-        self.assertEqual("1 minute before Planting Date", event_time(event))
+        self.assertEqual("1 minute before Planting Date", campaign_event_time(event))
 
     def test_activity_tags(self):
         self.create_campaign()
 
         contact = self.create_contact("Joe Blow", "tel:+1234")
-        msg = Msg.create_incoming(self.channel, "tel:+1234", "Inbound message")
+        msg = self.create_incoming_msg(contact, "Inbound message")
 
-        self.reminder_flow.start([], [self.joe])
+        flow = self.get_flow("color_v13")
+        nodes = flow.as_json()["nodes"]
+        color_prompt = nodes[0]
+        color_split = nodes[4]
 
-        # pretend that flow run made a webhook request
-        WebHookEvent.trigger_flow_webhook(FlowRun.objects.get(), "https://example.com", "1234", msg=None)
+        run = (
+            MockSessionWriter(self.joe, flow)
+            .visit(color_prompt)
+            .send_msg("What is your favorite color?", self.channel)
+            .call_webhook("POST", "https://example.com/", "1234")  # pretend that flow run made a webhook request
+            .visit(color_split)
+            .wait()
+            .save()
+        ).session.runs.get()
+
         result = WebHookResult.objects.get()
 
-        item = {"type": "webhook-result", "obj": result}
-        self.assertEqual(history_class(item), "non-msg")
+        item = {"type": "webhook_called", "obj": result}
+        self.assertEqual(history_class(item), "non-msg detail-event")
 
         result.status_code = 404
-        self.assertEqual(history_class(item), "non-msg warning")
+        self.assertEqual(history_class(item), "non-msg warning detail-event")
 
-        call = IVRCall.create_incoming(self.channel, contact, contact.urns.all().first(), self.admin, self.admin)
+        call = self.create_incoming_call(self.reminder_flow, contact)
 
-        item = {"type": "call", "obj": call}
+        item = {"type": "call_started", "obj": call}
         self.assertEqual(history_class(item), "non-msg")
 
         call.status = IVRCall.FAILED
         self.assertEqual(history_class(item), "non-msg warning")
 
         # inbound
-        item = {"type": "msg", "obj": msg}
-        self.assertEqual(activity_icon(item), '<span class="glyph icon-bubble-user"></span>')
+        item = {"type": "msg_received", "obj": msg}
+        self.assertEqual(history_icon(item), '<span class="glyph icon-bubble-user"></span>')
 
         # outgoing sent
+        item = {"type": "msg_created", "obj": msg}
         msg.direction = "O"
         msg.status = "S"
-        self.assertEqual(activity_icon(item), '<span class="glyph icon-bubble-right"></span>')
+        self.assertEqual(history_icon(item), '<span class="glyph icon-bubble-right"></span>')
 
         # outgoing delivered
         msg.status = "D"
-        self.assertEqual(activity_icon(item), '<span class="glyph icon-bubble-check"></span>')
+        self.assertEqual(history_icon(item), '<span class="glyph icon-bubble-check"></span>')
 
         # failed
         msg.status = "F"
-        self.assertEqual(activity_icon(item), '<span class="glyph icon-bubble-notification"></span>')
+        self.assertEqual(history_icon(item), '<span class="glyph icon-bubble-notification"></span>')
         self.assertEqual(history_class(item), "msg warning")
 
         # outgoing voice
         msg.msg_type = "V"
-        self.assertEqual(activity_icon(item), '<span class="glyph icon-call-outgoing"></span>')
+        self.assertEqual(history_icon(item), '<span class="glyph icon-call-outgoing"></span>')
         self.assertEqual(history_class(item), "msg warning")
 
         # incoming voice
+        item = {"type": "msg_received", "obj": msg}
         msg.direction = "I"
-        self.assertEqual(activity_icon(item), '<span class="glyph icon-call-incoming"></span>')
+        self.assertEqual(history_icon(item), '<span class="glyph icon-call-incoming"></span>')
         self.assertEqual(history_class(item), "msg warning")
 
         # simulate a broadcast to 2 people
         joe_and_frank = self.create_group("Joe and Frank", [self.joe, self.frank])
+        item = {"type": "msg_created", "obj": msg}
         msg.broadcast = Broadcast.create(self.org, self.admin, "Test message", groups=[joe_and_frank])
         msg.status = "F"
-        self.assertEqual(activity_icon(item), '<span class="glyph icon-bubble-notification"></span>')
+        msg.msg_type = "F"
+        self.assertEqual(history_icon(item), '<span class="glyph icon-bubble-notification"></span>')
 
         msg.status = "S"
-        self.assertEqual(activity_icon(item), '<span class="glyph icon-bullhorn"></span>')
+        with patch("temba.msgs.models.Broadcast.get_message_count") as mock_get_message_count:
+            mock_get_message_count.return_value = 2
+            self.assertEqual(history_icon(item), '<span class="glyph icon-bullhorn"></span>')
 
-        flow = self.create_flow()
-        flow.start([], [self.joe])
-        run = FlowRun.objects.last()
+            mock_get_message_count.return_value = 0
+            self.assertEqual(history_icon(item), '<span class="glyph icon-bubble-right"></span>')
 
-        item = {"type": "run-start", "obj": run}
-        self.assertEqual(activity_icon(item), '<span class="glyph icon-tree-2"></span>')
+        item = {"type": "flow_entered", "obj": run}
+        self.assertEqual(history_icon(item), '<span class="glyph icon-tree-2"></span>')
 
         run.run_event_type = "Invalid"
-        self.assertEqual(activity_icon(item), '<span class="glyph icon-tree-2"></span>')
+        self.assertEqual(history_icon(item), '<span class="glyph icon-tree-2"></span>')
 
-        item = {"type": "run-exit", "obj": run}
+        item = {"type": "flow_exited", "obj": run}
 
         run.exit_type = FlowRun.EXIT_TYPE_COMPLETED
-        self.assertEqual(activity_icon(item), '<span class="glyph icon-checkmark"></span>')
+        self.assertEqual(history_icon(item), '<span class="glyph icon-checkmark"></span>')
 
         run.exit_type = FlowRun.EXIT_TYPE_INTERRUPTED
-        self.assertEqual(activity_icon(item), '<span class="glyph icon-warning"></span>')
+        self.assertEqual(history_icon(item), '<span class="glyph icon-cancel-circle"></span>')
 
         run.exit_type = FlowRun.EXIT_TYPE_EXPIRED
-        self.assertEqual(activity_icon(item), '<span class="glyph icon-clock"></span>')
+        self.assertEqual(history_icon(item), '<span class="glyph icon-clock"></span>')
+
+        # manually create two event fires
+        pastDate = timezone.now() - timedelta(days=1)
+        event_fire = EventFire.objects.create(
+            event=self.message_event, contact=contact, scheduled=pastDate, fired=pastDate
+        )
+
+        item = {"type": "campaign_fired", "obj": event_fire}
+        self.assertEqual(history_icon(item), '<span class="glyph icon-clock"></span>')
+        self.assertEqual(history_class(item), "non-msg")
+
+        event_fire.fired_result = EventFire.RESULT_FIRED
+        self.assertEqual(history_icon(item), '<span class="glyph icon-clock"></span>')
+        self.assertEqual(history_class(item), "non-msg")
+
+        event_fire.fired_result = EventFire.RESULT_SKIPPED
+        self.assertEqual(history_icon(item), '<span class="glyph icon-clock"></span>')
+        self.assertEqual(history_class(item), "non-msg skipped")
+
+        # airtime transfer
+        transfer = AirtimeTransfer.objects.create(
+            org=self.org,
+            status="S",
+            contact=contact,
+            currency="RWF",
+            desired_amount=Decimal("100"),
+            actual_amount=Decimal("100"),
+            created_on=pastDate,
+        )
+        item = {"type": "airtime_transferred", "obj": transfer}
+        self.assertEqual(history_icon(item), '<span class="glyph icon-cash"></span>')
+        self.assertEqual(history_class(item), "non-msg detail-event")
 
     def test_get_scheduled_messages(self):
         self.just_joe = self.create_group("Just Joe", [self.joe])
@@ -3316,7 +3049,7 @@ class ContactTest(TembaTest):
         self.assertFalse(self.joe.get_scheduled_messages())
 
         schedule_time = timezone.now() + timedelta(days=2)
-        broadcast.schedule = Schedule.create_schedule(schedule_time, "O", self.admin)
+        broadcast.schedule = Schedule.create_schedule(self.org, self.admin, schedule_time, Schedule.REPEAT_NEVER)
         broadcast.save()
 
         self.assertEqual(self.joe.get_scheduled_messages().count(), 1)
@@ -3336,10 +3069,11 @@ class ContactTest(TembaTest):
         self.assertEqual(self.joe.get_scheduled_messages().count(), 1)
         self.assertTrue(broadcast in self.joe.get_scheduled_messages())
 
-        broadcast.schedule.reset()
+        broadcast.schedule.next_fire = None
+        broadcast.schedule.save(update_fields=["next_fire"])
         self.assertFalse(self.joe.get_scheduled_messages())
 
-    def test_contact_update_urns_field(self):
+    def test_update_urns_field(self):
         update_url = reverse("contacts.contact_update", args=[self.joe.pk])
 
         # we have a field to add new urns
@@ -3357,9 +3091,7 @@ class ContactTest(TembaTest):
         read_url = reverse("contacts.contact_read", args=[self.joe.uuid])
 
         for i in range(5):
-            self.create_msg(
-                direction="I", contact=self.joe, text="some msg no %d 2 send in sms language if u wish" % i
-            )
+            self.create_incoming_msg(self.joe, f"some msg no {i} 2 send in sms language if u wish")
             i += 1
 
         self.create_campaign()
@@ -3377,12 +3109,15 @@ class ContactTest(TembaTest):
                 message=msg,
             )
 
+        with MockParseQuery('planting_date != ""', ["planting_date"]):
+            planters = self.create_group("Planters", query='planting_date != ""')
+
         now = timezone.now()
         self.joe.set_field(self.user, "planting_date", (now + timedelta(days=1)).isoformat())
         EventFire.update_campaign_events(self.campaign)
 
         # should have seven fires, one for each campaign event
-        self.assertEqual(7, EventFire.objects.all().count())
+        self.assertEqual(7, EventFire.objects.filter(event__is_active=True).count())
 
         # visit a contact detail page as a user but not belonging to this organization
         self.login(self.user1)
@@ -3430,7 +3165,7 @@ class ContactTest(TembaTest):
         # add a scheduled broadcast
         broadcast = Broadcast.create(self.org, self.admin, "Hello", contacts=[self.joe])
         schedule_time = now + timedelta(days=5)
-        broadcast.schedule = Schedule.create_schedule(schedule_time, "O", self.admin)
+        broadcast.schedule = Schedule.create_schedule(self.org, self.admin, schedule_time, Schedule.REPEAT_NEVER)
         broadcast.save()
 
         response = self.fetch_protected(read_url, self.admin)
@@ -3460,29 +3195,39 @@ class ContactTest(TembaTest):
         # create kLab group, and add joe to the group
         klab = self.create_group("kLab", [self.joe])
 
-        # post to read url, joe's contact and kLab group
-        post_data = dict(contact=self.joe.id, group=klab.id)
-        response = self.client.post(read_url, post_data, follow=True)
+        # post with remove_from_group action to read url, with joe's contact and kLab group
+        response = self.client.post(read_url + "?action=remove_from_group", {"contact": self.joe.id, "group": klab.id})
 
         # this manager cannot operate on this organization
-        self.assertEqual(len(self.joe.user_groups.all()), 2)
+        self.assertEqual(302, response.status_code)
+        self.assertEqual(3, self.joe.user_groups.count())
         self.client.logout()
 
         # login as a manager of kLab
         self.login(self.admin)
 
         # remove this contact form kLab group
-        response = self.client.post(read_url, post_data, follow=True)
-        self.assertEqual(1, self.joe.user_groups.count())
+        response = self.client.post(read_url + "?action=remove_from_group", {"contact": self.joe.id, "group": klab.id})
 
-        # try removing it again, should fail
-        response = self.client.post(read_url, post_data, follow=True)
         self.assertEqual(200, response.status_code)
+        self.assertEqual(2, self.joe.user_groups.count())
+
+        # try removing it again, should noop
+        response = self.client.post(read_url + "?action=remove_from_group", {"contact": self.joe.id, "group": klab.id})
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(2, self.joe.user_groups.count())
+
+        # try removing from non-existent group
+        response = self.client.post(read_url + "?action=remove_from_group", {"contact": self.joe.id, "group": 2341533})
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(2, self.joe.user_groups.count())
+
+        # try removing from dynamic group (shouldnt happen, UI doesnt allow this)
+        with self.assertRaises(AssertionError):
+            self.client.post(read_url + "?action=remove_from_group", {"contact": self.joe.id, "group": planters.id})
 
         # can't view contact in another org
-        self.create_secondary_org()
-        hans = self.create_contact("Hans", twitter="hans", org=self.org2)
-        response = self.client.get(reverse("contacts.contact_read", args=[hans.uuid]))
+        response = self.client.get(reverse("contacts.contact_read", args=[self.other_org_contact.uuid]))
         self.assertLoginRedirect(response)
 
         # invalid UUID should return 404
@@ -3492,59 +3237,114 @@ class ContactTest(TembaTest):
         # super users can view history of any contact
         response = self.fetch_protected(reverse("contacts.contact_read", args=[self.joe.uuid]), self.superuser)
         self.assertEqual(response.status_code, 200)
-        response = self.fetch_protected(reverse("contacts.contact_read", args=[hans.uuid]), self.superuser)
+        response = self.fetch_protected(
+            reverse("contacts.contact_read", args=[self.other_org_contact.uuid]), self.superuser
+        )
         self.assertEqual(response.status_code, 200)
+
+    def test_read_with_customer_support(self):
+        self.customer_support.is_staff = True
+        self.customer_support.save()
+
+        self.login(self.customer_support)
+
+        response = self.client.get(reverse("contacts.contact_read", args=[self.joe.uuid]))
+
+        gear_links = response.context["view"].get_gear_links()
+        self.assertListEqual([gl["title"] for gl in gear_links], ["Service"])
+        self.assertEqual(
+            gear_links[-1]["href"],
+            f"/org/service/?organization={self.joe.org_id}&redirect_url=/contact/read/{self.joe.uuid}/",
+        )
 
     def test_read_language(self):
 
         # this is a bogus
         self.joe.language = "zzz"
-        self.joe.save(update_fields=("language",))
+        self.joe.save(update_fields=("language",), handle_update=False)
         response = self.fetch_protected(reverse("contacts.contact_read", args=[self.joe.uuid]), self.admin)
 
         # should just show the language code instead of the language name
         self.assertContains(response, "zzz")
 
         self.joe.language = "fra"
-        self.joe.save(update_fields=("language",))
+        self.joe.save(update_fields=("language",), handle_update=False)
         response = self.fetch_protected(reverse("contacts.contact_read", args=[self.joe.uuid]), self.admin)
 
         # with a proper code, we should see the language
         self.assertContains(response, "French")
 
-    def test_creating_duplicates(self):
+    def test_contacts_search(self):
+        search_url = reverse("contacts.contact_search")
         self.login(self.admin)
 
-        self.client.post(reverse("contacts.contactgroup_create"), dict(name="First Group"))
+        with patch("temba.mailroom.client.MailroomClient") as mock_mr:
+            instance = mock_mr.return_value
+            instance.contact_search.return_value = {
+                "contact_ids": [self.frank.id],
+                "total": 1,
+                "query": 'name ~ "Frank"',
+                "fields": ["name"],
+            }
 
-        # assert it was created
-        ContactGroup.user_groups.get(name="First Group")
+            response = self.client.get(search_url + "?search=Frank")
+            self.assertEqual(200, response.status_code)
+            results = response.json()
 
-        # try to create another group with the same name, but a dynamic query, should fail
-        response = self.client.post(
-            reverse("contacts.contactgroup_create"), dict(name="First Group", group_query="firsts")
-        )
-        self.assertFormError(response, "form", "name", "Name is used by another group")
+            # check that we get a total and a sample
+            self.assertEqual(1, results["total"])
+            self.assertEqual(1, len(results["sample"]))
+            self.assertEqual("+250 782 222 222", results["sample"][0]["primary_urn_formatted"])
 
-        # try to create another group with same name, not dynamic, same thing
-        response = self.client.post(
-            reverse("contacts.contactgroup_create"), dict(name="First Group", group_query="firsts")
-        )
-        self.assertFormError(response, "form", "name", "Name is used by another group")
+            # our query should get expanded into a proper query
+            self.assertEqual('name ~ "Frank"', results["query"])
+
+            # check no primary urn
+            self.frank.urns.all().delete()
+            response = self.client.get(search_url + "?search=Frank")
+            self.assertEqual(200, response.status_code)
+            results = response.json()
+            self.assertEqual("--", results["sample"][0]["primary_urn_formatted"])
+
+            # no query, no results
+            response = self.client.get(search_url)
+            results = response.json()
+            self.assertEqual(0, results["total"])
+
+        with patch("temba.mailroom.client.MailroomClient") as mock_mr:
+            instance = mock_mr.return_value
+            instance.contact_search.side_effect = MailroomException("", "", {"error": "parse exception"})
+
+            # bogus query
+            response = self.client.get(search_url + '?search=name="notclosed')
+            results = response.json()
+            self.assertEqual("parse exception", results["error"])
+            self.assertEqual(0, results["total"])
+
+        with patch("temba.mailroom.client.MailroomClient") as mock_mr:
+            instance = mock_mr.return_value
+            instance.contact_search.return_value = {
+                "contact_ids": [self.frank.id],
+                "total": 1,
+                "query": "age > 32",
+                "fields": ["age"],
+            }
+
+            # if we query a field, it should show up in our field dict
+            age = self.create_field("age", "Age", Value.TYPE_NUMBER)
+            response = self.client.get(search_url + "?search=age>32")
+            results = response.json()
+            self.assertEqual("Age", results["fields"][str(age.uuid)]["label"])
 
     def test_update_and_list(self):
+        self.setUpLocations()
+
         list_url = reverse("contacts.contact_list")
 
         self.just_joe = self.create_group("Just Joe", [self.joe])
         self.joe_and_frank = self.create_group("Joe and Frank", [self.joe, self.frank])
 
         self.joe_and_frank = ContactGroup.user_groups.get(pk=self.joe_and_frank.pk)
-
-        self.assertEqual(self.joe.groups_as_text(), "Joe and Frank, Just Joe")
-        group_analytic_json = self.joe_and_frank.analytics_json()
-        self.assertEqual(group_analytic_json["id"], self.joe_and_frank.pk)
-        self.assertEqual(group_analytic_json["name"], "Joe and Frank")
-        self.assertEqual(2, group_analytic_json["count"])
 
         # try to list contacts as a user not in the organization
         self.login(self.user1)
@@ -3569,11 +3369,7 @@ class ContactTest(TembaTest):
         self.assertEqual(len(self.joe_and_frank.contacts.all()), 2)
 
         # viewer cannot remove Joe from the group
-        post_data = dict()
-        post_data["action"] = "label"
-        post_data["label"] = self.just_joe.id
-        post_data["objects"] = self.joe.id
-        post_data["add"] = False
+        post_data = {"action": "label", "label": self.just_joe.id, "objects": self.joe.id, "add": False}
 
         # no change
         self.client.post(list_url, post_data, follow=True)
@@ -3631,28 +3427,27 @@ class ContactTest(TembaTest):
         self.assertFalse(ContactGroup.all_groups.get(name="New Test").is_active)
 
         # remove Joe from the group
-        post_data = dict()
-        post_data["action"] = "label"
-        post_data["label"] = self.just_joe.id
-        post_data["objects"] = self.joe.id
-        post_data["add"] = False
+        self.client.post(
+            list_url, {"action": "label", "label": self.just_joe.id, "objects": self.joe.id, "add": False}, follow=True
+        )
 
         # check the Joe is only removed from just_joe only and is still in joe_and_frank
-        self.client.post(list_url, post_data, follow=True)
         self.assertEqual(len(self.just_joe.contacts.all()), 0)
         self.assertEqual(len(self.joe_and_frank.contacts.all()), 2)
 
-        # Now add back Joe to the group
-        post_data = dict()
-        post_data["action"] = "label"
-        post_data["label"] = self.just_joe.id
-        post_data["objects"] = self.joe.id
-        post_data["add"] = True
+        # now add back Joe to the group
+        self.client.post(
+            list_url, {"action": "label", "label": self.just_joe.id, "objects": self.joe.id, "add": True}, follow=True
+        )
 
-        self.client.post(list_url, post_data, follow=True)
         self.assertEqual(len(self.just_joe.contacts.all()), 1)
         self.assertEqual(self.just_joe.contacts.all()[0].pk, self.joe.pk)
         self.assertEqual(len(self.joe_and_frank.contacts.all()), 2)
+
+        # test on a secondary org
+        other = self.create_group("Other Org", org=self.org2)
+        response = self.client.get(reverse("contacts.contact_filter", args=[other.uuid]))
+        self.assertLoginRedirect(response)
 
         # test filtering by group
         joe_and_frank_filter_url = reverse("contacts.contact_filter", args=[self.joe_and_frank.uuid])
@@ -3660,25 +3455,16 @@ class ContactTest(TembaTest):
         # now test when the action with some data missing
         self.assertEqual(self.joe.user_groups.filter(is_active=True).count(), 2)
 
-        post_data = dict()
-        post_data["action"] = "label"
-        post_data["objects"] = self.joe.id
-        post_data["add"] = True
-        self.client.post(joe_and_frank_filter_url, post_data)
+        self.client.post(joe_and_frank_filter_url, {"action": "label", "objects": self.joe.id, "add": True})
+
         self.assertEqual(self.joe.user_groups.filter(is_active=True).count(), 2)
 
-        post_data = dict()
-        post_data["action"] = "unlabel"
-        post_data["objects"] = self.joe.id
-        post_data["add"] = True
-        self.client.post(joe_and_frank_filter_url, post_data)
+        self.client.post(joe_and_frank_filter_url, {"action": "unlabel", "objects": self.joe.id, "add": True})
+
         self.assertEqual(self.joe.user_groups.filter(is_active=True).count(), 2)
 
-        # Now block Joe
-        post_data = dict()
-        post_data["action"] = "block"
-        post_data["objects"] = self.joe.id
-        self.client.post(list_url, post_data, follow=True)
+        # now block Joe
+        self.client.post(list_url, {"action": "block", "objects": self.joe.id}, follow=True)
 
         self.joe = Contact.objects.filter(pk=self.joe.pk)[0]
         self.assertEqual(self.joe.is_blocked, True)
@@ -3698,24 +3484,8 @@ class ContactTest(TembaTest):
         self.assertEqual(1, len(response.context["object_list"]))
         self.assertEqual(1, response.context["object_list"].count())  # from ContactGroupCount
 
-        # receiving an incoming message removes us from stopped
-        Msg.create_incoming(self.channel, str(self.frank.get_urn("tel")), "Incoming message")
-
-        response = self.client.get(stopped_url)
-        self.assertEqual(0, len(response.context["object_list"]))
-        self.assertEqual(0, response.context["object_list"].count())  # from ContactGroupCount
-
-        self.frank.refresh_from_db()
-        self.assertFalse(self.frank.is_stopped)
-
-        # mark frank stopped again
-        self.frank.stop(self.user)
-
         # have the user unstop them
-        post_data = dict()
-        post_data["action"] = "unstop"
-        post_data["objects"] = self.frank.id
-        self.client.post(stopped_url, post_data, follow=True)
+        self.client.post(stopped_url, {"action": "unstop", "objects": self.frank.id}, follow=True)
 
         response = self.client.get(stopped_url)
         self.assertEqual(0, len(response.context["object_list"]))
@@ -3735,10 +3505,14 @@ class ContactTest(TembaTest):
         response = self.client.get(blocked_url)
         self.assertEqual(list(response.context["object_list"]), [self.billy, self.joe])
 
-        # can search blocked contacts from this page
-        with patch("temba.utils.es.ES") as mock_ES:
-            mock_ES.search.return_value = {"_hits": [{"id": self.joe.id}]}
-            mock_ES.count.return_value = {"count": 1}
+        with patch("temba.mailroom.client.MailroomClient") as mock_mr:
+            instance = mock_mr.return_value
+            instance.contact_search.return_value = {
+                "contact_ids": [self.joe.id],
+                "total": 1,
+                "query": "name ~ Joe",
+                "fields": ["name"],
+            }
 
             response = self.client.get(blocked_url + "?search=Joe")
             self.assertEqual(list(response.context["object_list"]), [self.joe])
@@ -3768,18 +3542,24 @@ class ContactTest(TembaTest):
         self.joe.set_field(self.user, "state", " kiGali   citY ")  # should match "Kigali City"
 
         # check that the field appears on the update form
-        response = self.client.get(reverse("contacts.contact_update", args=[self.joe.id]))
-        self.assertEqual(
-            list(response.context["form"].fields.keys()), ["name", "groups", "urn__twitter__0", "urn__tel__1", "loc"]
-        )
-        self.assertEqual(response.context["form"].initial["name"], "Joe Blow")
-        self.assertEqual(response.context["form"].fields["urn__tel__1"].initial, "+250781111111")
+        with patch("temba.mailroom.client.MailroomClient") as mock_mr:
+            instance = mock_mr.return_value
+            instance.contact_modify.return_value = {"1": {"contact": {}, "events": []}}
 
-        contact_field = ContactField.objects.filter(key="state").first()
-        response = self.client.get(
-            "%s?field=%s" % (reverse("contacts.contact_update_fields", args=[self.joe.id]), contact_field.id)
-        )
-        self.assertEqual("Home state", response.context["contact_field"].label)
+            response = self.client.get(reverse("contacts.contact_update", args=[self.joe.id]))
+
+            self.assertEqual(
+                list(response.context["form"].fields.keys()),
+                ["name", "groups", "urn__twitter__0", "urn__tel__1", "loc"],
+            )
+            self.assertEqual(response.context["form"].initial["name"], "Joe Blow")
+            self.assertEqual(response.context["form"].fields["urn__tel__1"].initial, "+250781111111")
+
+            contact_field = ContactField.user_fields.filter(key="state").first()
+            response = self.client.get(
+                "%s?field=%s" % (reverse("contacts.contact_update_fields", args=[self.joe.id]), contact_field.id)
+            )
+            self.assertEqual("Home state", response.context["contact_field"].label)
 
         # grab our input field which is loaded async
         response = self.client.get(
@@ -3795,8 +3575,12 @@ class ContactTest(TembaTest):
         self.assertContains(response, "Eastern Province")
 
         # update joe - change his tel URN
-        data = dict(name="Joe Blow", urn__tel__1="+250 783835665", order__urn__tel__1="0")
-        self.client.post(reverse("contacts.contact_update", args=[self.joe.id]), data)
+        with patch("temba.mailroom.client.MailroomClient") as mock_mr:
+            instance = mock_mr.return_value
+            instance.contact_modify.return_value = {"1": {"contact": {}, "events": []}}
+
+            data = dict(name="Joe Blow", urn__tel__1="+250 783835665", order__urn__tel__1="0")
+            self.client.post(reverse("contacts.contact_update", args=[self.joe.id]), data)
 
         # update the state contact field to something invalid
         self.client.post(
@@ -3812,9 +3596,15 @@ class ContactTest(TembaTest):
         )  # raw user input as location wasn't matched
         self.assertIsNone(Contact.from_urn(self.org, "tel:+250781111111"))  # original tel is nobody now
 
-        # update joe, change his number back
-        data = dict(name="Joe Blow", urn__tel__0="+250781111111", order__urn__tel__0="0", __field__location="Kigali")
-        self.client.post(reverse("contacts.contact_update", args=[self.joe.id]), data)
+        with patch("temba.mailroom.client.MailroomClient") as mock_mr:
+            instance = mock_mr.return_value
+            instance.contact_modify.return_value = {"1": {"contact": {}, "events": []}}
+
+            # update joe, change his number back
+            data = dict(
+                name="Joe Blow", urn__tel__0="+250781111111", order__urn__tel__0="0", __field__location="Kigali"
+            )
+            self.client.post(reverse("contacts.contact_update", args=[self.joe.id]), data)
 
         # check that old URN is re-attached
         self.assertIsNone(ContactURN.objects.get(identity="tel:+250783835665").contact)
@@ -3832,65 +3622,84 @@ class ContactTest(TembaTest):
         post_data = dict(
             name="Joe Gashyantare", groups=[self.just_joe.id], urn__tel__0="+250781111111", urn__tel__1="+250786666666"
         )
-        response = self.client.post(reverse("contacts.contact_update", args=[self.joe.id]), post_data, follow=True)
-        self.assertEqual(response.context["contact"].name, "Joe Gashyantare")
+
+        with patch("temba.mailroom.client.MailroomClient") as mock_mr:
+            instance = mock_mr.return_value
+            instance.contact_modify.return_value = {"1": {"contact": {}, "events": []}}
+
+            response = self.client.post(reverse("contacts.contact_update", args=[self.joe.id]), post_data, follow=True)
+
+            instance.contact_modify.assert_called_once_with(
+                self.joe.org.id, self.admin.id, [self.joe.id], [{"type": "name", "name": "Joe Gashyantare"}]
+            )
+
         self.assertEqual(set(self.joe.user_groups.all()), {self.just_joe})
         self.assertTrue(ContactURN.objects.filter(contact=self.joe, path="+250781111111"))
         self.assertTrue(ContactURN.objects.filter(contact=self.joe, path="+250786666666"))
 
         # remove him from this group "Just joe", and his second number
         post_data = dict(name="Joe Gashyantare", urn__tel__0="+250781111111", groups=[])
-        response = self.client.post(reverse("contacts.contact_update", args=[self.joe.id]), post_data, follow=True)
-        self.assertEqual(set(self.joe.user_groups.all()), set())
-        self.assertTrue(ContactURN.objects.filter(contact=self.joe, path="+250781111111"))
-        self.assertFalse(ContactURN.objects.filter(contact=self.joe, path="+250786666666"))
 
-        # should no longer be in our update form either
-        response = self.client.get(reverse("contacts.contact_update", args=[self.joe.id]))
-        self.assertEqual(response.context["form"].fields["urn__tel__0"].initial, "+250781111111")
-        self.assertNotIn("urn__tel__1", response.context["form"].fields)
+        with patch("temba.mailroom.client.MailroomClient") as mock_mr:
+            instance = mock_mr.return_value
+            instance.contact_modify.return_value = {"1": {"contact": {}, "events": []}}
 
-        # check that groups field isn't displayed when contact is blocked
-        self.joe.block(self.user)
-        response = self.client.get(reverse("contacts.contact_update", args=[self.joe.id]))
-        self.assertNotIn("groups", response.context["form"].fields)
+            response = self.client.post(reverse("contacts.contact_update", args=[self.joe.id]), post_data, follow=True)
 
-        # and that we can still update the contact
-        post_data = dict(name="Joe Bloggs", urn__tel__0="+250781111111")
-        self.client.post(reverse("contacts.contact_update", args=[self.joe.id]), post_data, follow=True)
+            self.assertEqual(set(self.joe.user_groups.all()), set())
+            self.assertTrue(ContactURN.objects.filter(contact=self.joe, path="+250781111111"))
+            self.assertFalse(ContactURN.objects.filter(contact=self.joe, path="+250786666666"))
 
-        self.joe = Contact.objects.get(pk=self.joe.pk)
-        self.assertEqual(self.joe.name, "Joe Bloggs")
+            # should no longer be in our update form either
+            response = self.client.get(reverse("contacts.contact_update", args=[self.joe.id]))
+            self.assertEqual(response.context["form"].fields["urn__tel__0"].initial, "+250781111111")
+            self.assertNotIn("urn__tel__1", response.context["form"].fields)
 
-        self.joe.unblock(self.user)
+            # check that groups field isn't displayed when contact is blocked
+            self.joe.block(self.user)
+            response = self.client.get(reverse("contacts.contact_update", args=[self.joe.id]))
+            self.assertNotIn("groups", response.context["form"].fields)
 
-        # add new urn for joe
-        self.client.post(
-            reverse("contacts.contact_update", args=[self.joe.id]),
-            dict(name="Joey", urn__tel__0="+250781111111", new_scheme="ext", new_path="EXT123"),
-        )
+            instance.contact_modify.reset_mock()
 
-        urn = ContactURN.objects.filter(contact=self.joe, scheme="ext").first()
-        self.assertIsNotNone(urn)
-        self.assertEqual("EXT123", urn.path)
+            # and that we can still update the contact
+            post_data = dict(name="Joe Bloggs", urn__tel__0="+250781111111")
+            self.client.post(reverse("contacts.contact_update", args=[self.joe.id]), post_data, follow=True)
 
-        # now try adding one that is invalid
-        self.client.post(
-            reverse("contacts.contact_update", args=[self.joe.id]),
-            dict(name="Joey", urn__tel__0="+250781111111", new_scheme="mailto", new_path="malformed"),
-        )
-        self.assertIsNone(ContactURN.objects.filter(contact=self.joe, scheme="mailto").first())
+            instance.contact_modify.assert_called_once_with(
+                self.joe.org.id, self.admin.id, [self.joe.id], [{"type": "name", "name": "Joe Bloggs"}]
+            )
 
-        # update our language to something not on the org
-        self.joe.refresh_from_db()
-        self.joe.language = "fra"
-        self.joe.save(update_fields=("language",))
+            self.joe = Contact.objects.get(pk=self.joe.pk)
+            self.joe.unblock(self.user)
 
-        # add some languages to our org, but not french
-        self.client.post(reverse("orgs.org_languages"), dict(primary_lang="hat", languages="arc,spa"))
+            # add new urn for joe
+            self.client.post(
+                reverse("contacts.contact_update", args=[self.joe.id]),
+                dict(name="Joey", urn__tel__0="+250781111111", new_scheme="ext", new_path="EXT123"),
+            )
 
-        response = self.client.get(reverse("contacts.contact_update", args=[self.joe.id]))
-        self.assertContains(response, "French (Missing)")
+            urn = ContactURN.objects.filter(contact=self.joe, scheme="ext").first()
+            self.assertIsNotNone(urn)
+            self.assertEqual("EXT123", urn.path)
+
+            # now try adding one that is invalid
+            self.client.post(
+                reverse("contacts.contact_update", args=[self.joe.id]),
+                dict(name="Joey", urn__tel__0="+250781111111", new_scheme="mailto", new_path="malformed"),
+            )
+            self.assertIsNone(ContactURN.objects.filter(contact=self.joe, scheme="mailto").first())
+
+            # update our language to something not on the org
+            self.joe.refresh_from_db()
+            self.joe.language = "fra"
+            self.joe.save(update_fields=("language",), handle_update=False)
+
+            # add some languages to our org, but not french
+            self.client.post(reverse("orgs.org_languages"), dict(primary_lang="hat", languages="arc,spa"))
+
+            response = self.client.get(reverse("contacts.contact_update", args=[self.joe.id]))
+            self.assertContains(response, "French (Missing)")
 
         # update our contact with some locations
         state = ContactField.get_or_create(self.org, self.admin, "state", "Home State", value_type="S")
@@ -3930,7 +3739,7 @@ class ContactTest(TembaTest):
         self.assertContains(response, "Rwama Value")
 
         # bad field
-        contact_field = ContactField.objects.create(
+        contact_field = ContactField.user_fields.create(
             org=self.org, key="language", label="User Language", created_by=self.admin, modified_by=self.admin
         )
 
@@ -3945,7 +3754,7 @@ class ContactTest(TembaTest):
 
         # try to push into a dynamic group
         self.login(self.admin)
-        with ESMockWithScroll():
+        with MockParseQuery("tel = 325423", ["tel"]):
             group = self.create_group("Dynamo", query="tel = 325423")
 
         with self.assertRaises(ValueError):
@@ -3960,11 +3769,18 @@ class ContactTest(TembaTest):
         self.org.is_anon = True
         self.org.save()
 
-        post_data = dict(name="Joe X", groups=[self.just_joe.id])
-        self.client.post(reverse("contacts.contact_update", args=[self.joe.id]), post_data, follow=True)
+        with patch("temba.mailroom.client.MailroomClient") as mock_mr:
+            instance = mock_mr.return_value
+            instance.contact_modify.return_value = {"1": {"contact": {}, "events": []}}
+
+            post_data = dict(name="Joe X", groups=[self.just_joe.id])
+            self.client.post(reverse("contacts.contact_update", args=[self.joe.id]), post_data, follow=True)
+
+            instance.contact_modify.assert_called_once_with(
+                self.joe.org.id, self.admin.id, [self.joe.id], [{"type": "name", "name": "Joe X"}]
+            )
 
         self.joe.refresh_from_db()
-        self.assertEqual(self.joe.name, "Joe X")
         self.assertEqual({str(u) for u in self.joe.urns.all()}, {"tel:+250781111111", "ext:EXT123"})  # urns unaffected
 
         # remove all of joe's URNs
@@ -3985,6 +3801,131 @@ class ContactTest(TembaTest):
         self.assertFalse(ChannelEvent.objects.filter(contact=self.frank))
         self.assertFalse(ChannelEvent.objects.filter(id=event.id))
 
+    def test_contact_read_with_contactfields(self):
+        self.login(self.admin)
+
+        response = self.client.get(reverse("contacts.contact_read", args=[self.joe.uuid]))
+
+        self.assertEqual(len(response.context_data["all_contact_fields"]), 0)
+
+        # create some contact fields
+        ContactField.get_or_create(self.org, self.admin, "first", "First", priority=10)
+        ContactField.get_or_create(self.org, self.admin, "second", "Second")
+        ContactField.get_or_create(self.org, self.admin, "third", "Third", priority=20)
+
+        # update ContactField data
+        self.joe.set_field(self.admin, "first", "a simple value")
+
+        response = self.client.get(reverse("contacts.contact_read", args=[self.joe.uuid]))
+
+        # there should be one 'normal' field
+        self.assertEqual(len(response.context_data["all_contact_fields"]), 1)
+
+        # make 'third' field a featured field, but don't assign a value (it should still be visible on the page)
+        ContactField.get_or_create(self.org, self.admin, "third", "Third", priority=20, show_in_table=True)
+
+        response = self.client.get(reverse("contacts.contact_read", args=[self.joe.uuid]))
+
+        # there should be one 'normal' field and one 'featured' contact field
+        self.assertEqual(len(response.context_data["all_contact_fields"]), 2)
+
+        # assign a value to the 'third' field
+        self.joe.set_field(self.admin, "third", "a simple value")
+
+        response = self.client.get(reverse("contacts.contact_read", args=[self.joe.uuid]))
+
+        # there should be one 'normal' field and one 'featured' contact field
+        self.assertEqual(len(response.context_data["all_contact_fields"]), 2)
+
+    def test_contact_update_name_language(self):
+        self.login(self.admin)
+
+        self.client.post(reverse("orgs.org_languages"), dict(primary_lang="eng", languages="fra"))
+        self.assertIsNone(self.joe.language)
+
+        with patch("temba.mailroom.client.MailroomClient") as mock_mr:
+            instance = mock_mr.return_value
+            instance.contact_modify.return_value = {"1": {"contact": {}, "events": []}}
+
+            # no change, should not call mailroom contact modify
+            self.client.post(
+                reverse("contacts.contact_update", args=[self.joe.id]),
+                dict(language="", name="Joe Blow", urn__tel__0="+250781111111", urn__twitter__1="blow80"),
+            )
+            self.assertFalse(instance.contact_modify.called)
+            instance.contact_modify.reset_mock()
+
+            # set language, calls mailroom contact modify with language modifier only
+            self.client.post(
+                reverse("contacts.contact_update", args=[self.joe.id]),
+                dict(language="eng", name="Joe Blow", urn__tel__0="+250781111111", urn__twitter__1="blow80"),
+            )
+
+            instance.contact_modify.assert_called_once_with(
+                self.joe.org.id, self.admin.id, [self.joe.id], [{"type": "language", "language": "eng"}]
+            )
+
+            instance.contact_modify.reset_mock()
+
+            self.joe.refresh_from_db()
+            self.joe.language = "eng"
+            self.joe.save(update_fields=("language",), handle_update=False)
+
+            # set different name, calls mailroom contact modify with name modify only
+            self.client.post(
+                reverse("contacts.contact_update", args=[self.joe.id]),
+                dict(language="eng", name="Muller Awesome", urn__tel__0="+250781111111", urn__twitter__1="blow80"),
+            )
+
+            instance.contact_modify.assert_called_once_with(
+                self.joe.org.id, self.admin.id, [self.joe.id], [{"type": "name", "name": "Muller Awesome"}]
+            )
+
+            instance.contact_modify.reset_mock()
+
+            self.client.post(
+                reverse("contacts.contact_update", args=[self.joe.id]),
+                dict(language="fra", name="Muller Awesome", urn__tel__0="+250781111111", urn__twitter__1="blow80"),
+            )
+
+            instance.contact_modify.assert_called_once_with(
+                self.joe.org.id,
+                self.admin.id,
+                [self.joe.id],
+                [{"type": "name", "name": "Muller Awesome"}, {"type": "language", "language": "fra"}],
+            )
+
+            instance.contact_modify.side_effect = MailroomException("", "", {"error": "Error updating contact"})
+
+            # set different name and language with an error from mailroom, should displa some error message to user
+            response = self.client.post(
+                reverse("contacts.contact_update", args=[self.joe.id]),
+                dict(language="fra", name="Muller Awesome", urn__tel__0="+250781111111", urn__twitter__1="blow80"),
+            )
+
+            self.assertFormError(
+                response, "form", None, "An error occurred updating your contact. Please try again later."
+            )
+
+    def test_contact_model_update(self):
+        self.login(self.admin)
+
+        self.client.post(reverse("orgs.org_languages"), dict(primary_lang="eng", languages="fra"))
+        self.assertIsNone(self.joe.language)
+
+        with patch("temba.mailroom.client.MailroomClient") as mock_mr:
+            instance = mock_mr.return_value
+            instance.contact_modify.return_value = {"1": {"contact": {}, "events": []}}
+
+            self.joe.update(self.admin, "Muller", "eng")
+
+            instance.contact_modify.assert_called_once_with(
+                self.joe.org.id,
+                self.admin.id,
+                [self.joe.id],
+                [{"type": "name", "name": "Muller"}, {"type": "language", "language": "eng"}],
+            )
+
     def test_number_normalized(self):
         self.org.country = None
         self.org.save(update_fields=("country",))
@@ -3998,26 +3939,31 @@ class ContactTest(TembaTest):
         contact = Contact.from_urn(self.org, "tel:+447531669965")
         self.assertEqual("Ryan Lewis", contact.name)
 
-        # try the update case
-        self.client.post(
-            reverse("contacts.contact_update", args=[contact.id]),
-            dict(name="Marshal Mathers", urn__tel__0="07531669966"),
-        )
-        contact = Contact.from_urn(self.org, "tel:+447531669966")
-        self.assertEqual("Marshal Mathers", contact.name)
+        with patch("temba.mailroom.client.MailroomClient") as mock_mr:
+            instance = mock_mr.return_value
+            instance.contact_modify.return_value = {"1": {"contact": {}, "events": []}}
+
+            # try the update case
+            self.client.post(
+                reverse("contacts.contact_update", args=[contact.id]),
+                dict(name="Marshal Mathers", urn__tel__0="07531669966"),
+            )
+
+            instance.contact_modify.assert_called_once_with(
+                self.org.id, self.admin.id, [contact.id], [{"type": "name", "name": "Marshal Mathers"}]
+            )
+
+            contact_updated = Contact.from_urn(self.org, "tel:+447531669966")
+            self.assertEqual(contact_updated.pk, contact.pk)
 
     def test_contact_model(self):
-        contact1 = self.create_contact(name=None, number="123456")
-
-        contact1.set_first_name("Ludacris")
-        self.assertEqual(contact1.name, "Ludacris")
+        contact1 = self.create_contact(name="Ludacris", number="123456")
 
         first_modified_on = contact1.modified_on
         contact1.set_field(self.editor, "occupation", "Musician")
 
         contact1.refresh_from_db()
         self.assertTrue(contact1.modified_on > first_modified_on)
-        self.assertEqual(contact1.modified_by, self.editor)
 
         contact2 = self.create_contact(name="Boy", number="12345")
         self.assertEqual(contact2.get_display(), "Boy")
@@ -4222,7 +4168,7 @@ class ContactTest(TembaTest):
     @patch.object(ContactGroup, "MAX_ORG_CONTACTGROUPS", new=10)
     def test_contact_import(self):
         self.releaseContacts(delete=True)
-        self.release(ContactGroup.user_groups.all())
+        self.bulk_release(ContactGroup.user_groups.all())
         Channel.create(self.org, self.admin, None, "TT", "Twitter", "nyaruka", schemes=["twitter", "twitterid"])
         #
         # first import brings in 3 contacts
@@ -4314,7 +4260,7 @@ class ContactTest(TembaTest):
         self.assertEqual(response.context["group"], None)
 
         self.releaseContacts(delete=True)
-        self.release(ContactGroup.user_groups.all())
+        self.bulk_release(ContactGroup.user_groups.all())
 
         records, _ = self.do_import(user, "sample_contacts_UPPER.XLS")
         self.assertEqual(3, len(records))
@@ -4325,7 +4271,7 @@ class ContactTest(TembaTest):
         self.assertEqual(3, group.contacts.count())
 
         self.releaseContacts(delete=True)
-        self.release(ContactGroup.user_groups.all())
+        self.bulk_release(ContactGroup.user_groups.all())
 
         records, _ = self.do_import(user, "sample_contacts_with_filename_very_long_that_it_will_not_validate.xls")
         self.assertEqual(2, len(records))
@@ -4354,14 +4300,14 @@ class ContactTest(TembaTest):
         )
 
         self.releaseContacts(delete=True)
-        self.release(ContactGroup.user_groups.all())
+        self.bulk_release(ContactGroup.user_groups.all())
         contact = self.create_contact(name="Bob", number="+250788111111")
         contact.uuid = "uuid-1111"
-        contact.save(update_fields=("uuid",))
+        contact.save(update_fields=("uuid",), handle_update=False)
 
         contact2 = self.create_contact(name="Kobe", number="+250788383396")
         contact2.uuid = "uuid-4444"
-        contact2.save(update_fields=("uuid",))
+        contact2.save(update_fields=("uuid",), handle_update=False)
 
         self.assertEqual(list(contact.get_urns().values_list("path", flat=True)), ["+250788111111"])
         self.assertEqual(list(contact2.get_urns().values_list("path", flat=True)), ["+250788383396"])
@@ -4390,15 +4336,15 @@ class ContactTest(TembaTest):
         self.assertEqual(list(michael.get_urns().values_list("path", flat=True)), ["+250788383396"])
 
         self.releaseContacts(delete=True)
-        self.release(ContactGroup.user_groups.all())
+        self.bulk_release(ContactGroup.user_groups.all())
 
         contact = self.create_contact(name="Bob", number="+250788111111")
         contact.uuid = "uuid-1111"
-        contact.save(update_fields=("uuid",))
+        contact.save(update_fields=("uuid",), handle_update=False)
 
         contact2 = self.create_contact(name="Kobe", number="+250788383396")
         contact2.uuid = "uuid-4444"
-        contact2.save(update_fields=("uuid",))
+        contact2.save(update_fields=("uuid",), handle_update=False)
 
         self.assertEqual(list(contact.get_urns().values_list("path", flat=True)), ["+250788111111"])
         self.assertEqual(list(contact2.get_urns().values_list("path", flat=True)), ["+250788383396"])
@@ -4445,7 +4391,7 @@ class ContactTest(TembaTest):
             )
 
             self.releaseContacts(delete=True)
-            self.release(ContactGroup.user_groups.all())
+            self.bulk_release(ContactGroup.user_groups.all())
 
             self.assertContactImport(
                 "%s/test_imports/sample_contacts.xls" % settings.MEDIA_ROOT,
@@ -4453,7 +4399,7 @@ class ContactTest(TembaTest):
             )
 
         self.releaseContacts(delete=True)
-        self.release(ContactGroup.user_groups.all())
+        self.bulk_release(ContactGroup.user_groups.all())
 
         # import sample contact spreadsheet with valid headers
         self.assertContactImport(
@@ -4490,9 +4436,29 @@ class ContactTest(TembaTest):
                         line=3,
                         error="Missing any valid URNs; at least one among URN:tel, "
                         "URN:facebook, URN:twitter, URN:twitterid, URN:viber, URN:line, URN:telegram, URN:mailto, "
-                        "URN:ext, URN:jiochat, URN:wechat, URN:fcm, URN:whatsapp should be provided or a Contact UUID",
+                        "URN:ext, URN:jiochat, URN:wechat, URN:fcm, URN:whatsapp, URN:freshchat, URN:vk should be provided or a Contact UUID",
                     ),
                     dict(line=4, error="Invalid Phone number 12345"),
+                ],
+            ),
+        )
+
+        # import a spreadsheet where a contact has a missing phone number and another has an invalid urn
+        self.assertContactImport(
+            "%s/test_imports/sample_contacts_with_missing_and_invalid_urns.xls" % settings.MEDIA_ROOT,
+            dict(
+                records=1,
+                errors=2,
+                creates=0,
+                updates=1,
+                error_messages=[
+                    dict(
+                        line=3,
+                        error="Missing any valid URNs; at least one among URN:tel, "
+                        "URN:facebook, URN:twitter, URN:twitterid, URN:viber, URN:line, URN:telegram, URN:mailto, "
+                        "URN:ext, URN:jiochat, URN:wechat, URN:fcm, URN:whatsapp, URN:freshchat, URN:vk should be provided or a Contact UUID",
+                    ),
+                    dict(line=4, error="Invalid URN: abcdef"),
                 ],
             ),
         )
@@ -4504,7 +4470,7 @@ class ContactTest(TembaTest):
         )
 
         self.releaseContacts(delete=True)
-        self.release(ContactGroup.user_groups.all())
+        self.bulk_release(ContactGroup.user_groups.all())
 
         self.assertContactImport(
             "%s/test_imports/sample_contacts_bad_unicode.xls" % settings.MEDIA_ROOT,
@@ -4521,7 +4487,7 @@ class ContactTest(TembaTest):
         self.assertEqual(list(contact2.get_urns().values_list("path", flat=True)), ["+250788345345"])
 
         self.releaseContacts(delete=True)
-        self.release(ContactGroup.user_groups.all())
+        self.bulk_release(ContactGroup.user_groups.all())
 
         # import a spreadsheet with phone, name and twitter columns
         self.assertContactImport(
@@ -4548,7 +4514,7 @@ class ContactTest(TembaTest):
         self.assertEqual(1, Contact.objects.filter(name="Klab").count())
 
         self.releaseContacts(delete=True)
-        self.release(ContactGroup.user_groups.all())
+        self.bulk_release(ContactGroup.user_groups.all())
 
         # some columns have either twitter or phone
         self.assertContactImport(
@@ -4557,14 +4523,14 @@ class ContactTest(TembaTest):
         )
 
         self.releaseContacts(delete=True)
-        self.release(ContactGroup.user_groups.all())
+        self.bulk_release(ContactGroup.user_groups.all())
         contact = self.create_contact(name="Bob", number="+250788111111")
         contact.uuid = "uuid-1111"
-        contact.save(update_fields=("uuid",))
+        contact.save(update_fields=("uuid",), handle_update=False)
 
         contact2 = self.create_contact(name="Kobe", number="+250788383396")
         contact2.uuid = "uuid-4444"
-        contact2.save(update_fields=("uuid",))
+        contact2.save(update_fields=("uuid",), handle_update=False)
 
         self.assertEqual(list(contact.get_urns().values_list("path", flat=True)), ["+250788111111"])
         self.assertEqual(list(contact2.get_urns().values_list("path", flat=True)), ["+250788383396"])
@@ -4583,7 +4549,7 @@ class ContactTest(TembaTest):
                             line=3,
                             error="Missing any valid URNs; at least one among URN:tel, "
                             "URN:facebook, URN:twitter, URN:twitterid, URN:viber, URN:line, URN:telegram, URN:mailto, "
-                            "URN:ext, URN:jiochat, URN:wechat, URN:fcm, URN:whatsapp should be provided or a Contact UUID",
+                            "URN:ext, URN:jiochat, URN:wechat, URN:fcm, URN:whatsapp, URN:freshchat, URN:vk should be provided or a Contact UUID",
                         )
                     ],
                 ),
@@ -4638,15 +4604,15 @@ class ContactTest(TembaTest):
             self.assertEqual(list(michael.get_urns().values_list("path", flat=True)), ["+250788383396"])
 
         self.releaseContacts(delete=True)
-        self.release(ContactGroup.user_groups.all())
+        self.bulk_release(ContactGroup.user_groups.all())
 
         contact = self.create_contact(name="Bob", number="+250788111111")
         contact.uuid = "uuid-1111"
-        contact.save(update_fields=("uuid",))
+        contact.save(update_fields=("uuid",), handle_update=False)
 
         contact2 = self.create_contact(name="Kobe", number="+250788383396")
         contact2.uuid = "uuid-4444"
-        contact2.save(update_fields=("uuid",))
+        contact2.save(update_fields=("uuid",), handle_update=False)
 
         self.assertEqual(list(contact.get_urns().values_list("path", flat=True)), ["+250788111111"])
         self.assertEqual(list(contact2.get_urns().values_list("path", flat=True)), ["+250788383396"])
@@ -4665,7 +4631,7 @@ class ContactTest(TembaTest):
                             line=3,
                             error="Missing any valid URNs; at least one among URN:tel, "
                             "URN:facebook, URN:twitter, URN:twitterid, URN:viber, URN:line, URN:telegram, URN:mailto, "
-                            "URN:ext, URN:jiochat, URN:wechat, URN:fcm, URN:whatsapp should be provided or a Contact UUID",
+                            "URN:ext, URN:jiochat, URN:wechat, URN:fcm, URN:whatsapp, URN:freshchat, URN:vk should be provided or a Contact UUID",
                         )
                     ],
                 ),
@@ -4720,14 +4686,14 @@ class ContactTest(TembaTest):
             self.assertEqual(list(michael.get_urns().values_list("path", flat=True)), ["+250788383396"])
 
         self.releaseContacts(delete=True)
-        self.release(ContactGroup.user_groups.all())
+        self.bulk_release(ContactGroup.user_groups.all())
         contact = self.create_contact(name="Bob", number="+250788111111")
         contact.uuid = "uuid-1111"
-        contact.save(update_fields=("uuid",))
+        contact.save(update_fields=("uuid",), handle_update=False)
 
         contact2 = self.create_contact(name="Kobe", number="+250788383396")
         contact2.uuid = "uuid-4444"
-        contact2.save(update_fields=("uuid",))
+        contact2.save(update_fields=("uuid",), handle_update=False)
 
         self.assertEqual(list(contact.get_urns().values_list("path", flat=True)), ["+250788111111"])
         self.assertEqual(list(contact2.get_urns().values_list("path", flat=True)), ["+250788383396"])
@@ -4758,7 +4724,7 @@ class ContactTest(TembaTest):
         self.assertNoFormErrors(response)
 
         self.releaseContacts(delete=True)
-        self.release(ContactGroup.user_groups.all())
+        self.bulk_release(ContactGroup.user_groups.all())
 
         records, _ = self.do_import(user, "sample_contacts.xlsx")
         self.assertEqual(3, len(records))
@@ -4773,7 +4739,7 @@ class ContactTest(TembaTest):
         self.assertEqual(1, Contact.objects.filter(name="Jen Newcomer").count())
 
         self.releaseContacts(delete=True)
-        self.release(ContactGroup.user_groups.all())
+        self.bulk_release(ContactGroup.user_groups.all())
 
         with patch("temba.contacts.models.Org.get_country_code") as mock_country_code:
             mock_country_code.return_value = None
@@ -4818,7 +4784,7 @@ class ContactTest(TembaTest):
             "csv_file",
             'The file you provided is missing a required header. At least one of "URN:tel", "URN:facebook", '
             '"URN:twitter", "URN:twitterid", "URN:viber", "URN:line", "URN:telegram", "URN:mailto", "URN:ext", '
-            '"URN:jiochat", "URN:wechat", "URN:fcm", "URN:whatsapp" or "Contact UUID" should be included.',
+            '"URN:jiochat", "URN:wechat", "URN:fcm", "URN:whatsapp", "URN:freshchat", "URN:vk" or "Contact UUID" should be included.',
         )
 
         csv_file = open("%s/test_imports/sample_contacts_missing_name_phone_headers.xls" % settings.MEDIA_ROOT, "rb")
@@ -4830,7 +4796,7 @@ class ContactTest(TembaTest):
             "csv_file",
             'The file you provided is missing a required header. At least one of "URN:tel", "URN:facebook", '
             '"URN:twitter", "URN:twitterid", "URN:viber", "URN:line", "URN:telegram", "URN:mailto", "URN:ext", '
-            '"URN:jiochat", "URN:wechat", "URN:fcm", "URN:whatsapp" or "Contact UUID" should be included.',
+            '"URN:jiochat", "URN:wechat", "URN:fcm", "URN:whatsapp", "URN:freshchat", "URN:vk" or "Contact UUID" should be included.',
         )
 
         csv_file = open(
@@ -4859,7 +4825,7 @@ class ContactTest(TembaTest):
             "You must delete existing ones before you can create new ones.",
         )
 
-        self.release(ContactGroup.user_groups.all())
+        self.bulk_release(ContactGroup.user_groups.all())
 
         # check that no contacts or groups were created by any of the previous invalid imports
         self.assertEqual(Contact.objects.all().count(), 0)
@@ -4867,8 +4833,8 @@ class ContactTest(TembaTest):
 
         # existing field
         ContactField.get_or_create(self.org, self.admin, "ride_or_drive", "Vehicle")
-        ContactField.get_or_create(
-            self.org, self.admin, "wears", "Shoes"
+        shoes = ContactField.get_or_create(
+            self.org, self.admin, "wears", "Shoes", show_in_table=True
         )  # has trailing spaces on excel files as " Shoes  "
 
         # import spreadsheet with extra columns
@@ -4947,7 +4913,7 @@ class ContactTest(TembaTest):
         self.assertEqual(contact1.get_urn(schemes=[EXTERNAL_SCHEME]).path, "abc-1111")
 
         # if we change the field type for 'location' to 'datetime' we shouldn't get a category
-        ContactField.objects.filter(key="location").update(value_type=Value.TYPE_DATETIME)
+        ContactField.user_fields.filter(key="location").update(value_type=Value.TYPE_DATETIME)
         location.refresh_from_db()
         contact1 = Contact.objects.all().order_by("name")[0]
 
@@ -4955,7 +4921,7 @@ class ContactTest(TembaTest):
         self.assertEqual(contact1.get_field_value(location), None)
 
         # return it back to a state field
-        ContactField.objects.filter(key="location").update(value_type=Value.TYPE_STATE)
+        ContactField.user_fields.filter(key="location").update(value_type=Value.TYPE_STATE)
         location.refresh_from_db()
         contact1 = Contact.objects.all().order_by("name")[0]
 
@@ -4974,12 +4940,12 @@ class ContactTest(TembaTest):
         )  # persisted value is localized to org
         self.assertEqual(contact1.get_field_display(joined), "31-12-2014 00:00")  # display value is also localized
 
-        self.assertTrue(ContactField.objects.filter(org=self.org, label="Job and Projects"))
-        self.assertTrue(ContactField.objects.filter(org=self.org, label="Location"))
+        self.assertTrue(ContactField.user_fields.filter(org=self.org, label="Job and Projects"))
+        self.assertTrue(ContactField.user_fields.filter(org=self.org, label="Location"))
 
         # we never update existing contact fields labels or value types
-        self.assertTrue(ContactField.objects.filter(org=self.org, label="Shoes", value_type="T"))
-        self.assertFalse(ContactField.objects.filter(org=self.org, label="Shoes", value_type="N"))
+        self.assertTrue(ContactField.user_fields.filter(org=self.org, label="Shoes", value_type="T"))
+        self.assertFalse(ContactField.user_fields.filter(org=self.org, label="Shoes", value_type="N"))
 
         # import spreadsheet with extra columns again but check that giving column a reserved name
         # gives validation error
@@ -5030,7 +4996,7 @@ class ContactTest(TembaTest):
         post_data["column_country_label"] = "}{i$t0rY"  # supports only numbers, letters, hyphens
 
         response = self.client.post(customize_url, post_data, follow=True)
-        self.assertFormError(response, "form", None, "Field names can only contain letters, numbers, hypens")
+        self.assertFormError(response, "form", None, "Can only contain letters, numbers and hypens.")
 
         post_data["column_country_label"] = "Whatevaar"  # reset invalid label value with a valid one
         post_data["column_joined_label"] = "District"
@@ -5044,7 +5010,7 @@ class ContactTest(TembaTest):
         self.assertFormError(response, "form", None, "District should be used once")
 
         # wrong field with reserve word key
-        ContactField.objects.create(
+        ContactField.user_fields.create(
             org=self.org, key="language", label="Lang", created_by=self.admin, modified_by=self.admin
         )
 
@@ -5086,10 +5052,10 @@ class ContactTest(TembaTest):
             Contact.import_csv(task, log=None)
 
         self.releaseContacts(delete=True)
-        self.release(ContactGroup.user_groups.all())
+        self.bulk_release(ContactGroup.user_groups.all())
 
         # existing datetime field
-        ContactField.objects.create(
+        ContactField.user_fields.create(
             org=self.org,
             key="startdate",
             label="StartDate",
@@ -5119,12 +5085,81 @@ class ContactTest(TembaTest):
         start_date = ContactField.get_by_key(self.org, "startdate")
         self.assertEqual(contact1.get_field_serialized(start_date), "2014-12-31T10:00:00+02:00")
 
+        # check if shoes field 'show_in_table' flag has not changed
+        shoes.refresh_from_db()
+        self.assertTrue(shoes.show_in_table)
+
+        response = self.assertContactImport(
+            "%s/test_imports/sample_contacts_with_extra_field_with_label_as_label_name.xls" % settings.MEDIA_ROOT,
+            None,
+            task_customize=True,
+        )
+
+        customize_url = reverse("contacts.contact_customize", args=[response.context["task"].pk])
+
+        post_data = dict()
+        post_data["column_country_label_one_include"] = "on"
+        post_data["column_country_label_one_label"] = "Country Label One"
+        post_data["column_country_label_one_type"] = "T"
+        post_data["column_country_label_two_include"] = "on"
+        post_data["column_country_label_two_label"] = "Country Label Two"
+        post_data["column_country_label_two_type"] = "T"
+
+        response = self.client.post(customize_url, post_data, follow=True)
+        self.assertEqual(
+            response.context["results"], dict(records=3, errors=0, error_messages=[], creates=0, updates=3)
+        )
+
+        country_label_one = ContactField.user_fields.get(key="country_label_one")
+        self.assertEqual(country_label_one.label, "Country Label One")
+
+        country_label_two = ContactField.user_fields.get(key="country_label_two")
+        self.assertEqual(country_label_two.label, "Country Label Two")
+
+    def test_campaign_eventfires_on_systemfields_for_new_contacts(self):
+        self.login(self.admin)
+        self.create_campaign()
+
+        ballers = self.create_group("Ballers")
+
+        self.campaign.group = ballers
+        self.campaign.save()
+
+        field_created_on = self.org.contactfields.get(key="created_on")
+
+        self.created_on_event = CampaignEvent.create_flow_event(
+            self.org,
+            self.admin,
+            self.campaign,
+            relative_to=field_created_on,
+            offset=5,
+            unit="M",
+            flow=self.reminder_flow,
+        )
+
+        event_fires = EventFire.objects.filter(event=self.created_on_event)
+        self.assertEqual(event_fires.count(), 0)
+
+        contact, urn = Contact.get_or_create(self.org, "tel:123", user=self.user, name="Joe")
+
+        event_fires = EventFire.objects.filter(event=self.created_on_event)
+        self.assertEqual(event_fires.count(), 0)
+
+        ballers.update_contacts(self.admin, [contact], add=True)
+
+        event_fires = EventFire.objects.filter(event=self.created_on_event)
+        self.assertEqual(event_fires.count(), 1)
+
+        event_fire = EventFire.objects.filter(event=self.created_on_event).first()
+        contact_created_on = contact.created_on.replace(second=0, microsecond=0)
+        self.assertEqual(event_fire.scheduled, contact_created_on + timedelta(minutes=5))
+
     def test_contact_import_handle_update_contact(self):
         self.login(self.admin)
         self.create_campaign()
 
         self.create_field("team", "Team")
-        with ESMockWithScroll():
+        with MockParseQuery('team = "ballers"', ["team"]):
             ballers = self.create_group("Ballers", query="team = ballers")
 
         self.campaign.group = ballers
@@ -5320,10 +5355,12 @@ class ContactTest(TembaTest):
         self.assertEqual(c5.name, "Goran Dragic")
 
     def test_field_json(self):
+        self.setUpLocations()
+
         # simple text field
         self.joe.set_field(self.user, "dog", "Chef", label="Dog")
         self.joe.refresh_from_db()
-        dog_uuid = str(ContactField.objects.get(key="dog").uuid)
+        dog_uuid = str(ContactField.user_fields.get(key="dog").uuid)
 
         self.assertEqual(self.joe.fields, {dog_uuid: {"text": "Chef"}})
 
@@ -5335,6 +5372,11 @@ class ContactTest(TembaTest):
         self.joe.set_field(self.user, "dog", "23.00")
         self.joe.refresh_from_db()
         self.assertEqual(self.joe.fields, {dog_uuid: {"text": "23.00", "number": "23"}})
+
+        # numeric field value
+        self.joe.set_field(self.user, "dog", "37.27903")
+        self.joe.refresh_from_db()
+        self.assertEqual(self.joe.fields, {dog_uuid: {"text": "37.27903", "number": "37.27903"}})
 
         # numeric field values that could turn into shite due to normalization
         self.joe.set_field(self.user, "dog", "2300")
@@ -5356,7 +5398,7 @@ class ContactTest(TembaTest):
         # setting another field doesn't ruin anything
         self.joe.set_field(self.user, "cat", "Rando", label="Cat")
         self.joe.refresh_from_db()
-        cat_uuid = str(ContactField.objects.get(key="cat").uuid)
+        cat_uuid = str(ContactField.user_fields.get(key="cat").uuid)
         self.assertEqual(
             self.joe.fields,
             {
@@ -5428,8 +5470,8 @@ class ContactTest(TembaTest):
         )
 
         # change our state to an invalid field value type
-        ContactField.objects.filter(key="state").update(value_type="Z")
-        bad_field = ContactField.objects.get(key="state")
+        ContactField.user_fields.filter(key="state").update(value_type="Z")
+        bad_field = ContactField.user_fields.get(key="state")
 
         with self.assertRaises(ValueError):
             self.joe.get_field_serialized(bad_field)
@@ -5447,16 +5489,16 @@ class ContactTest(TembaTest):
         self.assertEqual(None, self.joe.get_field_serialized(abc))
 
         # try storing an integer, should get turned into a string
-        self.joe.set_field(self.user, "abc_1234", 1)
+        self.joe.set_field(self.user, "abc_1234", "1")
         self.assertEqual("1", self.joe.get_field_serialized(abc))
 
         # we should have a field with the key
-        ContactField.objects.get(key="abc_1234", label="Name", org=self.joe.org)
+        ContactField.user_fields.get(key="abc_1234", label="Name", org=self.joe.org)
 
         # setting with a different label should update it
         self.joe.set_field(self.user, "abc_1234", "Joe", label="First Name")
         self.assertEqual("Joe", self.joe.get_field_serialized(abc))
-        ContactField.objects.get(key="abc_1234", label="First Name", org=self.joe.org)
+        ContactField.user_fields.get(key="abc_1234", label="First Name", org=self.joe.org)
 
         modified_on = self.joe.modified_on
 
@@ -5483,6 +5525,8 @@ class ContactTest(TembaTest):
         self.assertIsNone(self.joe.get_field_json(birth_date).get("datetime"))
 
     def test_field_values(self):
+        self.setUpLocations()
+
         registration_field = ContactField.get_or_create(
             self.org, self.admin, "registration_date", "Registration Date", None, Value.TYPE_DATETIME
         )
@@ -5492,6 +5536,8 @@ class ContactTest(TembaTest):
         state_field = ContactField.get_or_create(self.org, self.admin, "state", "State", None, Value.TYPE_STATE)
 
         joe = Contact.objects.get(pk=self.joe.pk)
+        joe.language = "eng"
+        joe.save(update_fields=("language",), handle_update=False)
 
         # none value instances
         self.assertEqual(joe.get_field_serialized(weight_field), None)
@@ -5524,7 +5570,30 @@ class ContactTest(TembaTest):
         self.assertEqual(joe.get_field_serialized(color_field), "green")
         self.assertEqual(joe.get_field_display(color_field), "green")
 
+        field_created_on = self.org.contactfields.get(key="created_on")
+        field_language = self.org.contactfields.get(key="language")
+        field_name = self.org.contactfields.get(key="name")
+
+        self.assertEqual(joe.get_field_serialized(field_created_on), joe.created_on)
+        self.assertEqual(joe.get_field_display(field_created_on), self.org.format_datetime(joe.created_on))
+
+        self.assertEqual(joe.get_field_serialized(field_language), joe.language)
+        self.assertEqual(joe.get_field_display(field_language), "eng")
+
+        self.assertEqual(joe.get_field_serialized(field_name), joe.name)
+        self.assertEqual(joe.get_field_display(field_name), "Joe Blow")
+
+        # create a system field that is not supported
+        field_iban = ContactField.system_fields.create(
+            org_id=self.org.id, key="iban", label="IBAN", created_by_id=self.admin.id, modified_by_id=self.admin.id
+        )
+
+        self.assertRaises(ValueError, joe.get_field_serialized, field_iban)
+        self.assertRaises(ValueError, joe.get_field_display, field_iban)
+
     def test_set_location_fields(self):
+        self.setUpLocations()
+
         district_field = ContactField.get_or_create(
             self.org, self.admin, "district", "District", None, Value.TYPE_DISTRICT
         )
@@ -5560,6 +5629,7 @@ class ContactTest(TembaTest):
         self.assertEqual("Rwanda > Kigali City > Remera", joe.get_field_serialized(district_field))
 
     def test_set_location_ward_fields(self):
+        self.setUpLocations()
 
         state = AdminBoundary.create(osm_id="3710302", name="Kano", level=1, parent=self.country)
         district = AdminBoundary.create(osm_id="3710307", name="Bichi", level=2, parent=state)
@@ -5575,67 +5645,6 @@ class ContactTest(TembaTest):
         jemila.set_field(user1, "district", "bichi")
         jemila.set_field(user1, "ward", "bichi")
         self.assertEqual(jemila.get_field_serialized(ward), "Rwanda > Kano > Bichi > Bichi")
-
-    def test_expressions_context(self):
-        self.joe.urns.filter(scheme="twitter").delete()
-        ContactURN.create(self.joe.org, self.joe, "twitterid:12345#therealjoe")
-
-        context = self.joe.build_expressions_context()
-
-        self.assertEqual("Joe", context["first_name"])
-        self.assertEqual("Joe Blow", context["name"])
-        self.assertEqual("Joe Blow", context["__default__"])
-
-        self.assertEqual("0781 111 111", context["tel"]["__default__"])
-        self.assertEqual("+250781111111", context["tel"]["path"])
-        self.assertEqual("tel", context["tel"]["scheme"])
-        self.assertEqual("0781 111 111", context["tel"]["display"])
-        self.assertEqual("tel:+250781111111", context["tel"]["urn"])
-
-        self.assertEqual("", context["groups"])
-        self.assertEqual(context["uuid"], self.joe.uuid)
-        self.assertEqual(self.joe.uuid, context["uuid"])
-
-        self.assertEqual("therealjoe", context["twitter"]["__default__"])
-
-        self.assertEqual("therealjoe", context["twitterid"]["__default__"])
-        self.assertEqual("12345", context["twitterid"]["path"])
-        self.assertEqual("twitterid:12345#therealjoe", context["twitterid"]["urn"])
-
-        # add him to a group
-        self.create_group("Reporters", [self.joe])
-
-        # create a few contact fields, one active, one not
-        ContactField.get_or_create(self.org, self.admin, "team")
-        fav_color = ContactField.get_or_create(self.org, self.admin, "color")
-
-        self.joe = Contact.objects.get(pk=self.joe.pk)
-        self.joe.set_field(self.admin, "color", "Blue")
-        self.joe.set_field(self.admin, "team", "SeaHawks")
-
-        # make color inactivate
-        fav_color.is_active = False
-        fav_color.save()
-
-        context = self.joe.build_expressions_context()
-
-        self.assertEqual("Joe", context["first_name"])
-        self.assertEqual("Joe Blow", context["name"])
-        self.assertEqual("Joe Blow", context["__default__"])
-        self.assertEqual("0781 111 111", context["tel"]["__default__"])
-        self.assertEqual("Reporters", context["groups"])
-        self.assertNotIn("id", context)
-
-        self.assertEqual("SeaHawks", context["team"])
-        self.assertNotIn("color", context)
-
-        # switch our org to anonymous
-        with AnonymousOrg(self.org):
-            self.joe.org.refresh_from_db()
-
-            context = self.joe.build_expressions_context()
-            self.assertEqual("********", context["tel"])
-            self.assertEqual(self.joe.id, context["id"])
 
     def test_urn_priority(self):
         bob = self.create_contact("Bob")
@@ -5665,19 +5674,10 @@ class ContactTest(TembaTest):
         # it'll come back as the highest priority
         self.assertEqual("bob@marley.com", urns[0].path)
 
-        # but not the highest 'sendable' urn
-        contact, urn = Msg.resolve_recipient(self.org, self.admin, bob, self.channel)
-        self.assertEqual(urn.path, "789")
-
-        # swap our phone numbers
-        bob.update_urns(self.user, ["mailto:bob@marley.com", "tel:456", "tel:789"])
-        contact, urn = Msg.resolve_recipient(self.org, self.admin, bob, self.channel)
-        self.assertEqual(urn.path, "456")
-
     def test_update_handling(self):
         bob = self.create_contact("Bob", "111222")
         bob.name = "Bob Marley"
-        bob.save(update_fields=("name",))
+        bob.save(update_fields=("name",), handle_update=False)
 
         group = self.create_group("Customers", [])
 
@@ -5697,77 +5697,42 @@ class ContactTest(TembaTest):
 
         # run all tests as 2/Jan/2014 03:04 AFT
         tz = pytz.timezone("Asia/Kabul")
+
         with patch.object(timezone, "now", return_value=tz.localize(datetime(2014, 1, 2, 3, 4, 5, 6))):
             ContactField.get_or_create(self.org, self.admin, "age", "Age", value_type="N")
             ContactField.get_or_create(self.org, self.admin, "gender", "Gender", value_type="T")
             joined_field = ContactField.get_or_create(self.org, self.admin, "joined", "Join Date", value_type="D")
 
             # create groups based on name or URN (checks that contacts are added correctly on contact create)
-            mock_es_data = [
-                {
-                    "_type": "_doc",
-                    "_index": "dummy_index",
-                    "_source": {"id": self.joe.id, "modified_on": self.joe.modified_on.isoformat()},
-                }
-            ]
-            with ESMockWithScroll(data=mock_es_data):
+            with MockParseQuery('twitter = "blow80"', ["twitter"]):
                 joes_group = self.create_group("People called Joe", query='twitter = "blow80"')
 
-            mock_es_data = [
-                {
-                    "_type": "_doc",
-                    "_index": "dummy_index",
-                    "_source": {"id": self.joe.id, "modified_on": self.joe.modified_on.isoformat()},
-                },
-                {
-                    "_type": "_doc",
-                    "_index": "dummy_index",
-                    "_source": {"id": self.frank.id, "modified_on": self.frank.modified_on.isoformat()},
-                },
-            ]
-            with ESMockWithScroll(data=mock_es_data):
+            with MockParseQuery('tel ~ "078"', ["tel"]):
                 mtn_group = self.create_group("People with number containing '078'", query='tel has "078"')
 
             self.mary = self.create_contact("Mary", "+250783333333")
             self.mary.set_field(self.user, "gender", "Female")
-            self.mary.set_field(self.user, "age", 21)
+            self.mary.set_field(self.user, "age", "21")
             self.mary.set_field(self.user, "joined", "31/12/2013")
             self.annie = self.create_contact("Annie", "7879")
             self.annie.set_field(self.user, "gender", "Female")
-            self.annie.set_field(self.user, "age", 9)
+            self.annie.set_field(self.user, "age", "9")
             self.annie.set_field(self.user, "joined", "31/12/2013")
             self.joe.set_field(self.user, "gender", "Male")
-            self.joe.set_field(self.user, "age", 25)
+            self.joe.set_field(self.user, "age", "25")
             self.joe.set_field(self.user, "joined", "1/1/2014")
             self.frank.set_field(self.user, "gender", "Male")
-            self.frank.set_field(self.user, "age", 50)
+            self.frank.set_field(self.user, "age", "50")
             self.frank.set_field(self.user, "joined", "1/1/2014")
 
-            # create more groups based on fields (checks that contacts are added correctly on group create)
-            mock_es_data = [
-                {
-                    "_type": "_doc",
-                    "_index": "dummy_index",
-                    "_source": {"id": self.joe.id, "modified_on": self.joe.modified_on.isoformat()},
-                },
-                {
-                    "_type": "_doc",
-                    "_index": "dummy_index",
-                    "_source": {"id": self.frank.id, "modified_on": self.frank.modified_on.isoformat()},
-                },
-            ]
-            with ESMockWithScroll(data=mock_es_data):
+            with MockParseQuery('gender = "male" AND age >= 18', ["gender", "age"]):
                 men_group = self.create_group("Boys", query='gender = "male" AND age >= 18')
 
-            mock_es_data = [
-                {
-                    "_type": "_doc",
-                    "_index": "dummy_index",
-                    "_source": {"id": self.mary.id, "modified_on": self.mary.modified_on.isoformat()},
-                }
-            ]
-            with ESMockWithScroll(data=mock_es_data):
+            with MockParseQuery('gender = "female" AND age >= 18', ["gender", "age"]):
                 women_group = self.create_group("Girls", query='gender = "female" AND age >= 18')
+
+            for c in [self.frank, self.joe, self.mary]:
+                c.handle_update(is_new=True)
 
             joe_flow = self.create_flow()
             joes_campaign = Campaign.create(self.org, self.admin, "Joe Reminders", joes_group)
@@ -5788,14 +5753,6 @@ class ContactTest(TembaTest):
             self.assertEqual([self.frank, self.joe], list(men_group.contacts.order_by("name")))
             self.assertEqual([self.mary], list(women_group.contacts.order_by("name")))
             self.assertEqual([self.joe], list(joes_group.contacts.order_by("name")))
-
-            # try removing frank from dynamic group (shouldnt happen, ui doesnt allow this)
-            with self.assertRaises(ValueError):
-                self.login(self.admin)
-                self.client.post(
-                    reverse("contacts.contact_read", args=[self.frank.uuid]),
-                    dict(contact=self.frank.pk, group=men_group.pk),
-                )
 
             # check event fire initialized correctly
             joe_fires = EventFire.objects.filter(event=joes_event)
@@ -5818,104 +5775,6 @@ class ContactTest(TembaTest):
             # change Mary's URNs
             self.mary.update_urns(self.user, ["tel:54321", "twitter:mary_mary"])
             self.assertEqual([self.frank, self.joe], list(mtn_group.contacts.order_by("name")))
-
-    def test_simulator_contact_views(self):
-        simulator_contact = Contact.get_test_contact(self.admin)
-
-        other_contact = self.create_contact("Will", "+250788987987")
-
-        group = self.create_group("Members", [simulator_contact, other_contact])
-
-        self.login(self.admin)
-        response = self.client.get(reverse("contacts.contact_read", args=[simulator_contact.uuid]))
-        self.assertEqual(response.status_code, 404)
-
-        response = self.client.get(reverse("contacts.contact_update", args=[simulator_contact.pk]))
-        self.assertEqual(response.status_code, 404)
-
-        response = self.client.get(reverse("contacts.contact_list"))
-        self.assertEqual(response.status_code, 200)
-        self.assertFalse(simulator_contact in response.context["object_list"])
-        self.assertTrue(other_contact in response.context["object_list"])
-        self.assertNotContains(response, "Simulator Contact")
-
-        response = self.client.get(reverse("contacts.contact_filter", args=[group.uuid]))
-        self.assertEqual(response.status_code, 200)
-        self.assertFalse(simulator_contact in response.context["object_list"])
-        self.assertTrue(other_contact in response.context["object_list"])
-        self.assertNotContains(response, "Simulator Contact")
-
-    def test_preferred_channel(self):
-        from temba.msgs.tasks import process_message_task
-
-        ContactField.get_or_create(self.org, self.admin, "age", label="Age", value_type=Value.TYPE_NUMBER)
-        ContactField.get_or_create(self.org, self.admin, "gender", label="Gender", value_type=Value.TYPE_TEXT)
-
-        with ESMockWithScroll():
-            ContactGroup.create_dynamic(
-                self.org,
-                self.admin,
-                "simple group",
-                '(Age < 18 and gender = "male") or (Age > 18 and gender = "female")',
-            )
-            ContactGroup.create_dynamic(self.org, self.admin, "Empty age field", 'age = ""')
-            ContactGroup.create_dynamic(self.org, self.admin, "urn group", 'twitter = "macklemore"')
-
-        # create some channels of various types
-        twitter = Channel.create(self.org, self.user, None, "TT", name="Twitter Channel", address="@rapidpro")
-        Channel.create(self.org, self.user, None, "TG", name="Twitter Channel", address="@rapidpro")
-
-        # can't set preferred channel for test contacts
-        self.test_contact = self.create_contact(name="Test Contact", number="+12065551212", is_test=True)
-        self.test_contact.update_urns(self.admin, ["tel:+12065551212", "telegram:12515", "twitter:macklemore"])
-        self.test_contact.set_preferred_channel(twitter)
-        self.assertEqual(self.test_contact.urns.all()[0].scheme, TEL_SCHEME)
-
-        # update our contact URNs, give them telegram and twitter with telegram being preferred
-        self.joe.update_urns(self.admin, ["telegram:12515", "twitter:macklemore"])
-
-        # set the preferred channel to twitter
-        self.joe.set_preferred_channel(twitter)
-
-        # preferred URN should be twitter
-        self.assertEqual(self.joe.urns.all()[0].scheme, TWITTER_SCHEME)
-
-        # reset back to telegram being preferred
-        self.joe.update_urns(self.admin, ["telegram:12515", "twitter:macklemore"])
-
-        # simulate an incoming message from Mage on Twitter
-        msg = Msg.objects.create(
-            org=self.org,
-            channel=twitter,
-            contact=self.joe,
-            contact_urn=ContactURN.get_or_create(self.org, self.joe, "twitter:macklemore", twitter),
-            text="Incoming twitter DM",
-            created_on=timezone.now(),
-        )
-
-        with self.assertNumQueries(13):
-            process_message_task(dict(id=msg.id, from_mage=True, new_contact=False))
-
-        # twitter should be preferred outgoing again
-        self.assertEqual(self.joe.urns.all()[0].scheme, TWITTER_SCHEME)
-
-        # simulate an incoming message from Mage on Twitter, for a new contact
-        msg = Msg.objects.create(
-            org=self.org,
-            channel=twitter,
-            contact=self.joe,
-            contact_urn=ContactURN.get_or_create(self.org, self.joe, "twitter:macklemore", twitter),
-            text="Incoming twitter DM",
-            created_on=timezone.now(),
-        )
-
-        with self.assertNumQueries(19):
-            process_message_task(dict(id=msg.id, from_mage=True, new_contact=True))
-
-        self.assertCountEqual(
-            [group.name for group in self.joe.user_groups.filter(is_active=True).all()],
-            ["Empty age field", "urn group"],
-        )
 
 
 class ContactURNTest(TembaTest):
@@ -5951,10 +5810,28 @@ class ContactURNTest(TembaTest):
         self.assertEqual(urn.get_display(self.org, international=True), "+250 788 383 383")
         self.assertEqual(urn.get_display(self.org, formatted=False, international=True), "+250788383383")
 
+        # friendly tel formatting for whatsapp too
+        urn = ContactURN.objects.create(
+            org=self.org, scheme="whatsapp", path="12065551212", identity="whatsapp:12065551212", priority=50
+        )
+        self.assertEqual(urn.get_display(self.org), "(206) 555-1212")
+
+        # use path for other schemes
         urn = ContactURN.objects.create(
             org=self.org, scheme="twitter", path="billy_bob", identity="twitter:billy_bob", priority=50
         )
         self.assertEqual(urn.get_display(self.org), "billy_bob")
+
+        # unless there's a display property
+        urn = ContactURN.objects.create(
+            org=self.org,
+            scheme="twitter",
+            path="jimmy_john",
+            identity="twitter:jimmy_john",
+            priority=50,
+            display="JIM",
+        )
+        self.assertEqual(urn.get_display(self.org), "JIM")
 
 
 class ContactFieldTest(TembaTest):
@@ -5967,6 +5844,8 @@ class ContactFieldTest(TembaTest):
         self.contactfield_1 = ContactField.get_or_create(self.org, self.admin, "first", "First", priority=10)
         self.contactfield_2 = ContactField.get_or_create(self.org, self.admin, "second", "Second")
         self.contactfield_3 = ContactField.get_or_create(self.org, self.admin, "third", "Third", priority=20)
+
+        self.other_org_field = ContactField.get_or_create(self.org2, self.admin, "other", "Other", priority=10)
 
     def test_get_or_create(self):
         join_date = ContactField.get_or_create(self.org, self.admin, "join_date")
@@ -6008,14 +5887,14 @@ class ContactFieldTest(TembaTest):
         self.assertEqual(groups_field.label, "Groups")
 
         # we should lookup the existing field by label
-        label_field = ContactField.get_or_create(self.org, self.admin, "groups", "Groups")
+        label_field = ContactField.get_or_create(self.org, self.admin, key=None, label="Groups")
 
         self.assertEqual(label_field.key, "groups_field")
         self.assertEqual(label_field.label, "Groups")
-        self.assertFalse(ContactField.objects.filter(key="groups"))
+        self.assertFalse(ContactField.user_fields.filter(key="groups"))
         self.assertEqual(label_field.pk, groups_field.pk)
 
-        # exisiting field by label has invalid key we should try to create a new field
+        # existing field by label has invalid key we should try to create a new field
         groups_field.key = "groups"
         groups_field.save()
 
@@ -6025,27 +5904,28 @@ class ContactFieldTest(TembaTest):
         with self.assertRaises(ValueError):
             ContactField.get_or_create(self.org, self.admin, "name", "Groups")
 
+        # don't look up by label if we have a key
         created_field = ContactField.get_or_create(self.org, self.admin, "list", "Groups")
         self.assertEqual(created_field.key, "list")
-        self.assertEqual(created_field.label, "Groups")
+        self.assertEqual(created_field.label, "Groups 2")
 
         # this should be a different field
         self.assertFalse(created_field.pk == groups_field.pk)
 
         # check it is not possible to create two field with the same label
-        self.assertFalse(ContactField.objects.filter(key="sport"))
-        self.assertFalse(ContactField.objects.filter(key="play"))
+        self.assertFalse(ContactField.user_fields.filter(key="sport"))
+        self.assertFalse(ContactField.user_fields.filter(key="play"))
 
         field1 = ContactField.get_or_create(self.org, self.admin, "sport", "Games")
         self.assertEqual(field1.key, "sport")
         self.assertEqual(field1.label, "Games")
 
-        # should be the same field
+        # should modify label to make it unique
         field2 = ContactField.get_or_create(self.org, self.admin, "play", "Games")
 
-        self.assertEqual(field2.key, "sport")
-        self.assertEqual(field2.label, "Games")
-        self.assertEqual(field1.pk, field2.pk)
+        self.assertEqual(field2.key, "play")
+        self.assertEqual(field2.label, "Games 2")
+        self.assertNotEqual(field1.id, field2.id)
 
     def test_contact_templatetag(self):
         self.joe.set_field(self.user, "First", "Starter")
@@ -6055,6 +5935,7 @@ class ContactFieldTest(TembaTest):
     def test_make_key(self):
         self.assertEqual("first_name", ContactField.make_key("First Name"))
         self.assertEqual("second_name", ContactField.make_key("Second   Name  "))
+        self.assertEqual("caf", ContactField.make_key("café"))
         self.assertEqual(
             "323_ffsn_slfs_ksflskfs_fk_anfaddgas",
             ContactField.make_key("  ^%$# %$$ $##323 ffsn slfs ksflskfs!!!! fk$%%%$$$anfaDDGAS ))))))))) "),
@@ -6085,8 +5966,6 @@ class ContactFieldTest(TembaTest):
 
         self.login(self.admin)
 
-        flow = self.create_flow()
-
         # archive all our current contacts
         Contact.objects.filter(org=self.org).update(is_blocked=True)
 
@@ -6100,7 +5979,19 @@ class ContactFieldTest(TembaTest):
 
         contact.set_field(self.user, "Third", "20/12/2015 08:30")
 
-        flow.start([], [contact])
+        flow = self.get_flow("color_v13")
+        nodes = flow.as_json()["nodes"]
+        color_prompt = nodes[0]
+        color_split = nodes[4]
+
+        (
+            MockSessionWriter(self.joe, flow)
+            .visit(color_prompt)
+            .send_msg("What is your favorite color?", self.channel)
+            .visit(color_split)
+            .wait()
+            .save()
+        )
 
         # create another contact, this should sort before Ben
         contact2 = self.create_contact("Adam Sumner", "+12067799191", twitter="adam", language="eng")
@@ -6110,12 +6001,10 @@ class ContactFieldTest(TembaTest):
         contact2.update_urns(self.admin, urns)
 
         group = self.create_group("Poppin Tags", [contact, contact2])
-        with ESMockWithScroll():
+        with MockParseQuery("tel = 1234", ["tel"]):
             group2 = self.create_group("Dynamic", query="tel is 1234")
         group2.status = ContactGroup.STATUS_EVALUATING
         group2.save()
-
-        Contact.get_test_contact(self.user)  # create test contact to ensure they aren't included in the export
 
         # create a dummy export task so that we won't be able to export
         blocking_export = ExportContactsTask.create(self.org, self.admin)
@@ -6126,6 +6015,13 @@ class ContactFieldTest(TembaTest):
         # ok, mark that one as finished and try again
         blocking_export.update_status(ExportContactsTask.STATUS_COMPLETE)
 
+        # make sure we can't redirect to places we shouldn't
+        response = self.client.post(
+            reverse("contacts.contact_export") + "?redirect=http://foo.me/", dict(group_memberships=(group.pk,))
+        )
+        self.assertEqual(302, response.status_code)
+        self.assertEqual("/contact/", response.url)
+
         def request_export(query=""):
             self.client.post(reverse("contacts.contact_export") + query, dict(group_memberships=(group.pk,)))
             task = ExportContactsTask.objects.all().order_by("-id").first()
@@ -6133,8 +6029,20 @@ class ContactFieldTest(TembaTest):
             workbook = load_workbook(filename=filename)
             return workbook.worksheets
 
+        def assertImportExportedFile(query=""):
+            # test an export can be imported back
+            self.client.post(reverse("contacts.contact_export") + query, dict(group_memberships=(group.pk,)))
+            task = ExportContactsTask.objects.all().order_by("-id").first()
+            filename = "%s/test_orgs/%d/contact_exports/%s.xlsx" % (settings.MEDIA_ROOT, self.org.pk, task.uuid)
+
+            csv_file = open(filename, "rb")
+            post_data = dict(csv_file=csv_file)
+            response = self.client.post(reverse("contacts.contact_import"), post_data, follow=True)
+
+            self.assertIsNotNone(response.context["task"])
+
         # no group specified, so will default to 'All Contacts'
-        with self.assertNumQueries(48):
+        with self.assertNumQueries(49):
             export = request_export()
             self.assertExcelSheet(
                 export[0],
@@ -6182,10 +6090,12 @@ class ContactFieldTest(TembaTest):
                 tz=self.org.timezone,
             )
 
+        assertImportExportedFile()
+
         # change the order of the fields
         self.contactfield_2.priority = 15
         self.contactfield_2.save()
-        with self.assertNumQueries(48):
+        with self.assertNumQueries(49):
             export = request_export()
             self.assertExcelSheet(
                 export[0],
@@ -6235,6 +6145,7 @@ class ContactFieldTest(TembaTest):
                 ],
                 tz=self.org.timezone,
             )
+        assertImportExportedFile()
 
         # more contacts do not increase the queries
         contact3 = self.create_contact("Luol Deng", "+12078776655", twitter="deng")
@@ -6242,7 +6153,7 @@ class ContactFieldTest(TembaTest):
         ContactURN.create(self.org, contact, "tel:+12062233445")
 
         # but should have additional Twitter and phone columns
-        with self.assertNumQueries(48):
+        with self.assertNumQueries(49):
             export = request_export()
             self.assertExcelSheet(
                 export[0],
@@ -6324,9 +6235,10 @@ class ContactFieldTest(TembaTest):
                 ],
                 tz=self.org.timezone,
             )
+        assertImportExportedFile()
 
         # export a specified group of contacts (only Ben and Adam are in the group)
-        with self.assertNumQueries(49):
+        with self.assertNumQueries(50):
             self.assertExcelSheet(
                 request_export("?g=%s" % group.uuid)[0],
                 [
@@ -6376,132 +6288,153 @@ class ContactFieldTest(TembaTest):
                 tz=self.org.timezone,
             )
 
+        assertImportExportedFile("?g=%s" % group.uuid)
+
         # export a search
         mock_es_data = [
             {"_type": "_doc", "_index": "dummy_index", "_source": {"id": contact2.id}},
             {"_type": "_doc", "_index": "dummy_index", "_source": {"id": contact3.id}},
         ]
-        with ESMockWithScroll(data=mock_es_data):
-            with self.assertNumQueries(47):
-                self.assertExcelSheet(
-                    request_export("?s=name+has+adam+or+name+has+deng")[0],
-                    [
-                        [
-                            "Contact UUID",
-                            "Name",
-                            "Language",
-                            "Created On",
-                            "URN:Mailto",
-                            "URN:Tel",
-                            "URN:Tel",
-                            "URN:Telegram",
-                            "URN:Twitter",
-                            "Field:Third",
-                            "Field:Second",
-                            "Field:First",
-                        ],
-                        [
-                            contact2.uuid,
-                            "Adam Sumner",
-                            "eng",
-                            contact2.created_on,
-                            "adam@sumner.com",
-                            "+12067799191",
-                            "",
-                            "1234",
-                            "adam",
-                            "",
-                            "",
-                            "",
-                        ],
-                        [
-                            contact3.uuid,
-                            "Luol Deng",
-                            "",
-                            contact3.created_on,
-                            "",
-                            "+12078776655",
-                            "",
-                            "",
-                            "deng",
-                            "",
-                            "",
-                            "",
-                        ],
-                    ],
-                    tz=self.org.timezone,
-                )
+        with self.assertLogs("temba.contacts.models", level="INFO") as captured_logger:
+            with patch(
+                "temba.contacts.models.ExportContactsTask.LOG_PROGRESS_PER_ROWS", new_callable=PropertyMock
+            ) as log_info_threshold:
+                # make sure that we trigger logger
+                log_info_threshold.return_value = 1
+
+                with ESMockWithScroll(data=mock_es_data):
+                    with MockParseQuery(query='name ~ "adam" OR name ~ "deng"', fields=["name"]):
+                        with self.assertNumQueries(50):
+                            self.assertExcelSheet(
+                                request_export("?s=name+has+adam+or+name+has+deng")[0],
+                                [
+                                    [
+                                        "Contact UUID",
+                                        "Name",
+                                        "Language",
+                                        "Created On",
+                                        "URN:Mailto",
+                                        "URN:Tel",
+                                        "URN:Tel",
+                                        "URN:Telegram",
+                                        "URN:Twitter",
+                                        "Field:Third",
+                                        "Field:Second",
+                                        "Field:First",
+                                    ],
+                                    [
+                                        contact2.uuid,
+                                        "Adam Sumner",
+                                        "eng",
+                                        contact2.created_on,
+                                        "adam@sumner.com",
+                                        "+12067799191",
+                                        "",
+                                        "1234",
+                                        "adam",
+                                        "",
+                                        "",
+                                        "",
+                                    ],
+                                    [
+                                        contact3.uuid,
+                                        "Luol Deng",
+                                        "",
+                                        contact3.created_on,
+                                        "",
+                                        "+12078776655",
+                                        "",
+                                        "",
+                                        "deng",
+                                        "",
+                                        "",
+                                        "",
+                                    ],
+                                ],
+                                tz=self.org.timezone,
+                            )
+
+                        self.assertEqual(len(captured_logger.output), 2)
+                        self.assertTrue("contacts - 50% (1/2)" in captured_logger.output[0])
+                        self.assertTrue("contacts - 100% (2/2)" in captured_logger.output[1])
+
+                        assertImportExportedFile("?s=name+has+adam+or+name+has+deng")
 
         # export a search within a specified group of contacts
         mock_es_data = [{"_type": "_doc", "_index": "dummy_index", "_source": {"id": contact.id}}]
         with ESMockWithScroll(data=mock_es_data):
-            with self.assertNumQueries(48):
+            with MockParseQuery(query='name ~ "Hagg"', fields=["name"]):
+                with self.assertNumQueries(49):
+                    self.assertExcelSheet(
+                        request_export("?g=%s&s=Hagg" % group.uuid)[0],
+                        [
+                            [
+                                "Contact UUID",
+                                "Name",
+                                "Language",
+                                "Created On",
+                                "URN:Mailto",
+                                "URN:Tel",
+                                "URN:Tel",
+                                "URN:Telegram",
+                                "URN:Twitter",
+                                "Field:Third",
+                                "Field:Second",
+                                "Field:First",
+                            ],
+                            [
+                                contact.uuid,
+                                "Ben Haggerty",
+                                "",
+                                contact.created_on,
+                                "",
+                                "+12067799294",
+                                "+12062233445",
+                                "",
+                                "",
+                                "20-12-2015 08:30",
+                                "",
+                                "One",
+                            ],
+                        ],
+                        tz=self.org.timezone,
+                    )
+
+                assertImportExportedFile("?g=%s&s=Hagg" % group.uuid)
+
+        # now try with an anonymous org
+        with AnonymousOrg(self.org):
+            with MockParseQuery(query='name ~ "Hagg"', fields=["name"]):
                 self.assertExcelSheet(
-                    request_export("?g=%s&s=Hagg" % group.uuid)[0],
+                    request_export()[0],
                     [
                         [
+                            "ID",
                             "Contact UUID",
                             "Name",
                             "Language",
                             "Created On",
-                            "URN:Mailto",
-                            "URN:Tel",
-                            "URN:Tel",
-                            "URN:Telegram",
-                            "URN:Twitter",
                             "Field:Third",
                             "Field:Second",
                             "Field:First",
                         ],
+                        [str(contact2.id), contact2.uuid, "Adam Sumner", "eng", contact2.created_on, "", "", ""],
                         [
+                            str(contact.id),
                             contact.uuid,
                             "Ben Haggerty",
                             "",
                             contact.created_on,
-                            "",
-                            "+12067799294",
-                            "+12062233445",
-                            "",
-                            "",
                             "20-12-2015 08:30",
                             "",
                             "One",
                         ],
+                        [str(contact3.id), contact3.uuid, "Luol Deng", "", contact3.created_on, "", "", ""],
+                        [str(contact4.id), contact4.uuid, "Stephen", "", contact4.created_on, "", "", ""],
                     ],
                     tz=self.org.timezone,
                 )
-
-        # now try with an anonymous org
-        with AnonymousOrg(self.org):
-            self.assertExcelSheet(
-                request_export()[0],
-                [
-                    [
-                        "ID",
-                        "Contact UUID",
-                        "Name",
-                        "Language",
-                        "Created On",
-                        "Field:Third",
-                        "Field:Second",
-                        "Field:First",
-                    ],
-                    [str(contact2.id), contact2.uuid, "Adam Sumner", "eng", contact2.created_on, "", "", ""],
-                    [
-                        str(contact.id),
-                        contact.uuid,
-                        "Ben Haggerty",
-                        "",
-                        contact.created_on,
-                        "20-12-2015 08:30",
-                        "",
-                        "One",
-                    ],
-                    [str(contact3.id), contact3.uuid, "Luol Deng", "", contact3.created_on, "", "", ""],
-                    [str(contact4.id), contact4.uuid, "Stephen", "", contact4.created_on, "", "", ""],
-                ],
-                tz=self.org.timezone,
-            )
+                assertImportExportedFile()
 
     def test_prepare_sort_field_struct(self):
         ward = ContactField.get_or_create(self.org, self.admin, "ward", "Home Ward", value_type=Value.TYPE_WARD)
@@ -6622,19 +6555,24 @@ class ContactFieldTest(TembaTest):
         url = reverse("contacts.contact_list")
         self.login(self.admin)
 
-        with patch("temba.utils.es.ES") as mock_ES:
-            mock_ES.search.return_value = {"_hits": [{"id": self.joe.id}]}
-            mock_ES.count.return_value = {"count": 1}
+        with patch("temba.mailroom.client.MailroomClient") as mock_mr:
+            instance = mock_mr.return_value
+            instance.contact_search.return_value = {
+                "contact_ids": [self.joe.id],
+                "total": 1,
+                "query": "",
+                "fields": ["age"],
+            }
 
-            response = self.client.get("%s?sort_on=%s" % (url, str(self.contactfield_1.uuid)))
+            response = self.client.get("%s?sort_on=%s" % (url, str(self.contactfield_1.key)))
 
-            self.assertEqual(response.context["sort_field"], str(self.contactfield_1.uuid))
+            self.assertEqual(response.context["sort_field"], str(self.contactfield_1.key))
             self.assertEqual(response.context["sort_direction"], "asc")
             self.assertTrue("search" not in response.context)
 
-            response = self.client.get("%s?sort_on=-%s" % (url, str(self.contactfield_1.uuid)))
+            response = self.client.get("%s?sort_on=-%s" % (url, str(self.contactfield_1.key)))
 
-            self.assertEqual(response.context["sort_field"], str(self.contactfield_1.uuid))
+            self.assertEqual(response.context["sort_field"], str(self.contactfield_1.key))
             self.assertEqual(response.context["sort_direction"], "desc")
             self.assertTrue("search" not in response.context)
 
@@ -6650,80 +6588,35 @@ class ContactFieldTest(TembaTest):
             self.assertEqual(response.context["sort_direction"], "desc")
             self.assertTrue("search" in response.context)
 
-    def test_contact_field_list(self):
-        url = reverse("contacts.contactfield_list")
-        self.login(self.admin)
-        response = self.client.get(url)
-
-        # label and key
-        self.assertContains(response, "First")
-        self.assertContains(response, "first")
-        self.assertContains(response, "Second")
-        self.assertContains(response, "second")
-
-        # try a search and make sure we filter out the second one
-        response = self.client.get("%s?search=first" % url)
-        self.assertContains(response, "First")
-        self.assertContains(response, "first")
-        self.assertNotContains(response, "Second")
-
     def test_delete_with_flow_dependency(self):
         self.login(self.admin)
         self.get_flow("dependencies")
 
-        manage_fields_url = reverse("contacts.contactfield_managefields")
-        response = self.client.get(manage_fields_url)
+        dependant_field = ContactField.user_fields.filter(is_active=True, org=self.org, key="favorite_cat").get()
+        delete_contactfield_url = reverse("contacts.contactfield_delete", args=[dependant_field.id])
 
-        # prep our post_data from the form in our response
-        post_data = dict()
-        for id, field in response.context["form"].fields.items():
-            if field.initial is None:
-                post_data[id] = ""
-            elif isinstance(field.initial, ContactField):
-                post_data[id] = field.initial.pk
-            else:
-                post_data[id] = field.initial
+        response = self.client.get(delete_contactfield_url)
 
-        # find our favorite_cat contact field
-        favorite_cat = None
-        for key, value in post_data.items():
-            if value == "Favorite Cat":
-                favorite_cat = key
-        self.assertIsNotNone(favorite_cat)
-
-        # try deleting favorite_cat, should not work since our flow depends on it
-        before = ContactField.objects.filter(org=self.org, is_active=True).count()
-
-        # make sure we can't delete it directly
-        with self.assertRaises(Exception):
-            ContactField.hide_field(self.org, self.admin, "favorite_cat")
-
-        # or through the ui
-        post_data[favorite_cat] = ""
-        response = self.client.post(manage_fields_url, post_data, follow=True)
+        # there is a flow that is using this field
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(before, ContactField.objects.filter(org=self.org, is_active=True).count())
-        self.assertFormError(
-            response,
-            "form",
-            None,
-            'The field "Favorite Cat" cannot be removed while it is still used in the flow "Dependencies"',
-        )
+        self.assertTrue(response.context_data["has_uses"])
 
-        # remove it from our list of dependencies
-        from temba.flows.models import Flow
+        with self.assertRaises(ValueError):
+            # try to delete the contactfield, though there is a dependency
+            self.client.post(delete_contactfield_url)
 
-        flow = Flow.objects.filter(name="Dependencies").first()
-        flow.field_dependencies.clear()
+        # delete method is not allowed on the Delete ContactField view
+        response = self.client.delete(delete_contactfield_url)
+        self.assertEqual(response.status_code, 405)
 
-        # now we should be successful
-        response = self.client.post(manage_fields_url, post_data, follow=True)
-        self.assertEqual(response.status_code, 200)
-        self.assertNotIn("form", response.context)
-        self.assertEqual(before - 1, ContactField.objects.filter(org=self.org, is_active=True).count())
+    def test_hide_field_with_flow_dependency(self):
+        self.get_flow("dependencies")
 
-    def test_manage_fields(self):
-        manage_fields_url = reverse("contacts.contactfield_managefields")
+        with self.assertRaises(ValueError):
+            ContactField.hide_field(self.org, self.admin, key="favorite_cat")
+
+    def test_list(self):
+        manage_fields_url = reverse("contacts.contactfield_list")
 
         self.login(self.non_org_user)
         response = self.client.get(manage_fields_url)
@@ -6732,185 +6625,506 @@ class ContactFieldTest(TembaTest):
         self.assertEqual(302, response.status_code)
 
         self.login(self.admin)
-        response = self.client.get(manage_fields_url)
-        self.assertEqual(len(response.context["form"].fields), 20)
-
-        post_data = dict()
-        for id, field in response.context["form"].fields.items():
-            if field.initial is None:
-                post_data[id] = ""
-            elif isinstance(field.initial, ContactField):
-                post_data[id] = field.initial.pk
-            else:
-                post_data[id] = field.initial
-
-        response = self.client.post(manage_fields_url, post_data, follow=True)
-        self.assertEqual(response.status_code, 200)
-
-        # make sure we didn't have an error
-        self.assertNotIn("form", response.context)
-
-        # should still have three contact fields
-        self.assertEqual(3, ContactField.objects.filter(org=self.org, is_active=True).count())
-
-        # fields name should be unique case insensitively
-        post_data["label_1"] = "Town"
-        post_data["label_2"] = "town"
-
-        response = self.client.post(manage_fields_url, post_data, follow=True)
-        self.assertFormError(response, "form", None, "Field names must be unique. 'town' is duplicated")
-        self.assertEqual(3, ContactField.objects.filter(org=self.org, is_active=True).count())
-        self.assertFalse(ContactField.objects.filter(org=self.org, label__in=["town", "Town"]))
-
-        # now remove the first field, rename the second and change the type on the third
-        post_data["label_1"] = ""
-        post_data["label_2"] = "Number 2"
-        post_data["type_3"] = "N"
-        post_data["label_4"] = "New Field"
-
-        response = self.client.post(manage_fields_url, post_data, follow=True)
-        self.assertEqual(response.status_code, 200)
-
-        # make sure we didn't have an error
-        self.assertNotIn("form", response.context)
-
-        # first field was blank, so it should be inactive
-        self.assertIsNone(ContactField.objects.filter(org=self.org, key="third", is_active=True).first())
-
-        # the second should be renamed
-        self.assertEqual(
-            "Number 2", ContactField.objects.filter(org=self.org, key="first", is_active=True).first().label
-        )
-
-        # the third should have a different type
-        self.assertEqual(
-            "N", ContactField.objects.filter(org=self.org, key="second", is_active=True).first().value_type
-        )
-
-        # we should have a fourth field now
-        self.assertTrue(ContactField.objects.filter(org=self.org, key="new_field", label="New Field", value_type="T"))
-
-        # check that a field name which is a reserved field, gives an error
-        post_data["label_2"] = "name"
-        response = self.client.post(manage_fields_url, post_data, follow=True)
-        self.assertFormError(response, "form", None, "Field name 'name' is a reserved word")
-
-        # check that a field name which contains disallowed characters, gives an error
-        post_data["label_2"] = "@name"
-        response = self.client.post(manage_fields_url, post_data, follow=True)
-        self.assertFormError(response, "form", None, "Field names can only contain letters, numbers and hypens")
-
-        post_data["label_2"] = "Name"
-        response = self.client.post(manage_fields_url, post_data, follow=True)
-        self.assertFormError(response, "form", None, "Field name 'Name' is a reserved word")
-
-        # bad field
-        ContactField.objects.create(
-            org=self.org, key="language", label="User Language", created_by=self.admin, modified_by=self.admin
-        )
-
-        self.assertEqual(4, ContactField.objects.filter(org=self.org, is_active=True).count())
 
         response = self.client.get(manage_fields_url)
-        post_data = dict()
-        for id, field in response.context["form"].fields.items():
-            if field.initial is None:
-                post_data[id] = ""
-            elif isinstance(field.initial, ContactField):
-                post_data[id] = field.initial.pk
-            else:
-                post_data[id] = field.initial
+        self.assertEqual(len(response.context["object_list"]), 3)
 
-        response = self.client.post(manage_fields_url, post_data, follow=True)
+        # deactivate a field
+        a_contactfield = ContactField.user_fields.order_by("id").first()
+        a_contactfield.is_active = False
+        a_contactfield.save(update_fields=("is_active",))
+
+        response = self.client.get(manage_fields_url)
+        self.assertEqual(len(response.context["object_list"]), 2)
+
+    def test_view_create_valid(self):
+        # we have three fields
+        self.assertEqual(ContactField.user_fields.filter(org=self.org).count(), 3)
+        # there are not featured fields
+        self.assertEqual(ContactField.user_fields.filter(org=self.org, show_in_table=True).count(), 0)
+
+        self.login(self.admin)
+
+        create_url = reverse("contacts.contactfield_create")
+
+        response = self.client.get(create_url)
+        self.assertEqual(response.status_code, 200)
+
+        # we got a form with expected form fields
+        self.assertListEqual(
+            list(response.context["form"].fields.keys()), ["label", "value_type", "show_in_table", "loc"]
+        )
+
+        # a valid form
+        post_data = {"label": "this is a label", "value_type": "T", "show_in_table": True}
+
+        response = self.client.post(create_url, post_data)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNoFormErrors(response, post_data)
+
+        # after creating a field there should be 4
+        self.assertEqual(ContactField.user_fields.filter(org=self.org).count(), 4)
+        # newly created field is featured
+        self.assertEqual(ContactField.user_fields.filter(org=self.org, show_in_table=True).count(), 1)
+
+    def test_view_create_field_with_same_name_as_deleted_field(self):
+        create_url = reverse("contacts.contactfield_create")
+        self.login(self.admin)
+
+        # we have three fields
+        self.assertEqual(ContactField.user_fields.filter(org=self.org).count(), 3)
+
+        old_first = ContactField.get_or_create(self.org, self.admin, "first")
+        # a valid form
+        post_data = {"label": old_first.label, "value_type": old_first.value_type}
+
+        response = self.client.post(create_url, post_data)
+
+        # field cannot be created because there is an active field 'First'
+        self.assertFormError(response, "form", None, "Must be unique.")
+
+        # then we hide the field
+        ContactField.hide_field(self.org, self.admin, key="first")
+
+        # and try to create a new field
+        response = self.client.post(create_url, post_data)
+        self.assertNoFormErrors(response, post_data)
+
+        # after creating a field there should be 4
+        self.assertEqual(ContactField.user_fields.filter(org=self.org).count(), 4)
+        # there are two fields with "First" label, but only one is active
+        self.assertEqual(ContactField.user_fields.filter(org=self.org, label="First").count(), 2)
+
+        new_first = ContactField.get_or_create(self.org, self.admin, "first")
+
+        self.assertNotEqual(new_first.uuid, old_first.uuid)
+
+    def test_view_create_invalid(self):
+        self.login(self.admin)
+
+        create_cf_url = reverse("contacts.contactfield_create")
+
+        response = self.client.get(create_cf_url)
+        self.assertEqual(response.status_code, 200)
+
+        # we got a form with expected form fields
+        self.assertListEqual(
+            list(response.context["form"].fields.keys()), ["label", "value_type", "show_in_table", "loc"]
+        )
+
+        # an empty form
+        post_data = {}
+
+        response = self.client.post(create_cf_url, post_data)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFormError(response, "form", None, "Can only contain letters, numbers and hypens.")
+        self.assertFormError(response, "form", "value_type", "This field is required.")
+
+        # a form with an invalid label
+        post_data = {"label": "!@#"}
+
+        response = self.client.post(create_cf_url, post_data)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFormError(response, "form", None, "Can only contain letters, numbers and hypens.")
+
+        # a form trying to create a field that already exists
+        post_data = {"label": "First"}
+
+        response = self.client.post(create_cf_url, post_data)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFormError(response, "form", None, "Must be unique.")
+
+        # a form creating a field that does not have a valid key
+        post_data = {"label": "modified by"}
+
+        response = self.client.post(create_cf_url, post_data)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFormError(response, "form", None, "Can't be a reserved word")
+
+        with override_settings(MAX_ACTIVE_CONTACTFIELDS_PER_ORG=2):
+            # a valid form, but ORG has reached max active fields limit
+            post_data = {"label": "teefilter", "value_type": "T"}
+
+            response = self.client.post(create_cf_url, post_data)
+
+            self.assertEqual(response.status_code, 200)
+            self.assertFormError(response, "form", None, "Cannot create a new field as limit is 2.")
+
+        # value_type not supported
+        post_data = {"label": "teefilter", "value_type": "J"}
+
+        response = self.client.post(create_cf_url, post_data)
+
+        self.assertEqual(response.status_code, 200)
         self.assertFormError(
-            response, "form", None, "Field key language has invalid characters " "or is a reserved field name"
+            response, "form", "value_type", "Select a valid choice. J is not one of the available choices."
+        )
+
+    def test_update(self):
+        cf_to_update = ContactField.user_fields.get(key="first")
+
+        self.login(self.admin)
+
+        update_url = reverse("contacts.contactfield_update", args=(cf_to_update.id,))
+
+        response = self.client.get(update_url)
+        self.assertEqual(response.status_code, 200)
+
+        initial_data = {"label": "First", "value_type": "T", "show_in_table": False}
+
+        # we got a form with expected form fields
+        self.assertListEqual(
+            list(response.context["form"].fields.keys()), ["label", "value_type", "show_in_table", "loc"]
+        )
+        self.assertDictEqual(response.context["form"].initial, initial_data)
+
+        initial_data["show_in_table"] = True
+        initial_data["label"] = "First 1"
+
+        response = self.client.post(update_url, initial_data)
+        self.assertEqual(response.status_code, 200)
+        self.assertNoFormErrors(response, initial_data)
+
+        cf_to_update.refresh_from_db()
+        self.assertEqual(cf_to_update.label, "First 1")
+
+        # can't update field in other org
+        response = self.client.post(
+            reverse("contacts.contactfield_update", args=[self.other_org_field.id]),
+            {"label": "Changed", "value_type": "T", "show_in_table": False},
+        )
+        self.assertLoginRedirect(response)
+
+        # check field isn't changed
+        self.other_org_field.refresh_from_db()
+        self.assertEqual("Other", self.other_org_field.label)
+
+    def test_view_update_invalid(self):
+        self.login(self.admin)
+
+        # cannot update a contact field which does not exist
+        update_cf_url = reverse("contacts.contactfield_update", args=(123_123,))
+
+        response = self.client.get(update_cf_url)
+        self.assertEqual(response.status_code, 404)
+
+        # cannot update a contact field which does not exist
+        response = self.client.post(update_cf_url, {})
+        self.assertEqual(response.status_code, 404)
+
+        # get a valid field to update
+        cf_to_update = ContactField.user_fields.get(key="first")
+        update_cf_url = reverse("contacts.contactfield_update", args=(cf_to_update.id,))
+
+        response = self.client.get(update_cf_url)
+
+        # we got a form with expected form fields
+        self.assertListEqual(
+            list(response.context["form"].fields.keys()), ["label", "value_type", "show_in_table", "loc"]
+        )
+
+        # an empty form
+        post_data = {}
+
+        response = self.client.post(update_cf_url, post_data)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFormError(response, "form", None, "Can only contain letters, numbers and hypens.")
+        self.assertFormError(response, "form", "value_type", "This field is required.")
+
+        # a form with an invalid label
+        post_data = {"label": "!@#"}
+
+        response = self.client.post(update_cf_url, post_data)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFormError(response, "form", None, "Can only contain letters, numbers and hypens.")
+
+        # a form trying to create a field that already exists
+        post_data = {"label": "Second"}
+
+        response = self.client.post(update_cf_url, post_data)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFormError(response, "form", None, "Must be unique.")
+
+        # a form creating a field that does not have a valid key
+        post_data = {"label": "modified by"}
+
+        response = self.client.post(update_cf_url, post_data)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFormError(response, "form", None, "Can't be a reserved word")
+
+        # value_type not supported
+        post_data = {"label": "teefilter", "value_type": "J"}
+
+        response = self.client.post(update_cf_url, post_data)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFormError(
+            response, "form", "value_type", "Select a valid choice. J is not one of the available choices."
+        )
+
+    def test_view_delete(self):
+        cf_to_delete = ContactField.user_fields.get(key="first")
+        self.assertTrue(cf_to_delete.is_active)
+
+        self.login(self.admin)
+
+        delete_url = reverse("contacts.contactfield_delete", args=(cf_to_delete.id,))
+
+        response = self.client.get(delete_url)
+        self.assertEqual(response.status_code, 200)
+
+        # we got a form with expected form fields
+        self.assertFalse(response.context_data["has_uses"])
+
+        # delete the field
+        response = self.client.post(delete_url)
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.context_data["has_uses"])
+
+        cf_to_delete.refresh_from_db()
+
+        self.assertFalse(cf_to_delete.is_active)
+
+        # can't delete field from other org
+        response = self.client.post(reverse("contacts.contactfield_delete", args=[self.other_org_field.id]))
+        self.assertLoginRedirect(response)
+
+        # field should be unchanged
+        self.other_org_field.refresh_from_db()
+        self.assertTrue(self.other_org_field.is_active)
+
+    def test_view_featured(self):
+        featured1 = ContactField.user_fields.get(key="first")
+        featured1.show_in_table = True
+        featured1.save(update_fields=["show_in_table"])
+
+        featured2 = ContactField.user_fields.get(key="second")
+        featured2.show_in_table = True
+        featured2.save(update_fields=["show_in_table"])
+
+        self.login(self.admin)
+
+        featured_cf_url = reverse("contacts.contactfield_featured")
+
+        response = self.client.get(featured_cf_url)
+        self.assertEqual(response.status_code, 200)
+
+        # there are 2 featured fields
+        self.assertEqual(len(response.context_data["object_list"]), 2)
+
+        self.assertEqual(len(response.context_data["cf_categories"]), 2)
+        self.assertEqual(len(response.context_data["cf_types"]), 1)
+
+        self.assertTrue(response.context_data["is_featured_category"])
+
+    def test_view_filter_by_type(self):
+        self.login(self.admin)
+
+        # an invalid type
+        featured_cf_url = reverse("contacts.contactfield_filter_by_type", args=("xXx",))
+
+        response = self.client.get(featured_cf_url)
+        self.assertEqual(response.status_code, 200)
+
+        # there are no contact fields
+        self.assertEqual(len(response.context_data["object_list"]), 0)
+
+        # a type that is valid
+        featured_cf_url = reverse("contacts.contactfield_filter_by_type", args=("T"))
+
+        response = self.client.get(featured_cf_url)
+        self.assertEqual(response.status_code, 200)
+
+        # there are some contact fields of type text
+        self.assertEqual(len(response.context_data["object_list"]), 3)
+
+        self.assertEqual(response.context_data["selected_value_type"], "T")
+
+    def test_view_detail(self):
+
+        self.login(self.admin)
+        flow = self.get_flow("dependencies")
+        dependant_field = ContactField.user_fields.filter(is_active=True, org=self.org, key="favorite_cat").get()
+        dependant_field.value_type = Value.TYPE_DATETIME
+        dependant_field.save(update_fields=("value_type",))
+
+        farmers = self.create_group("Farmers", [self.joe])
+        campaign = Campaign.create(self.org, self.admin, "Planting Reminders", farmers)
+
+        # create flow events
+        CampaignEvent.create_flow_event(
+            self.org,
+            self.admin,
+            campaign,
+            relative_to=dependant_field,
+            offset=0,
+            unit="D",
+            flow=flow,
+            delivery_hour=17,
+        )
+        inactive_campaignevent = CampaignEvent.create_flow_event(
+            self.org,
+            self.admin,
+            campaign,
+            relative_to=dependant_field,
+            offset=0,
+            unit="D",
+            flow=flow,
+            delivery_hour=20,
+        )
+        inactive_campaignevent.is_active = False
+        inactive_campaignevent.save(update_fields=("is_active",))
+
+        detail_contactfield_url = reverse("contacts.contactfield_detail", args=[dependant_field.id])
+
+        response = self.client.get(detail_contactfield_url)
+        self.assertEqual(response.status_code, 200)
+
+        self.assertEqual(response.context_data["object"].label, "Favorite Cat")
+
+        self.assertEqual(len(response.context_data["dep_flows"]), 1)
+        # there should be only one active campaign event
+        self.assertEqual(len(response.context_data["dep_campaignevents"]), 1)
+        self.assertEqual(len(response.context_data["dep_groups"]), 0)
+
+    def test_view_updatepriority_valid(self):
+        org_fields = ContactField.user_fields.filter(org=self.org, is_active=True)
+
+        self.assertListEqual([10, 0, 20], [cf.priority for cf in org_fields.order_by("id")])
+
+        self.login(self.admin)
+        updatepriority_cf_url = reverse("contacts.contactfield_update_priority")
+
+        # there should be no updates because CFs with ids do not exist
+        post_data = json.dumps({123_123: 1000, 123_124: 999, 123_125: 998})
+
+        response = self.client.post(updatepriority_cf_url, post_data, content_type="application/json")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "OK")
+
+        self.assertListEqual([10, 0, 20], [cf.priority for cf in org_fields.order_by("id")])
+
+        # build valid post data
+        post_data = json.dumps({cf.id: index for index, cf in enumerate(org_fields.order_by("id"))})
+
+        # try to update as admin2
+        self.login(self.admin2)
+        response = self.client.post(updatepriority_cf_url, post_data, content_type="application/json")
+
+        # nothing changed
+        self.assertListEqual([10, 0, 20], [cf.priority for cf in org_fields.order_by("id")])
+
+        # then as real admin
+        self.login(self.admin)
+        response = self.client.post(updatepriority_cf_url, post_data, content_type="application/json")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "OK")
+
+        self.assertListEqual([0, 1, 2], [cf.priority for cf in org_fields.order_by("id")])
+
+    def test_view_updatepriority_invalid(self):
+        org_fields = ContactField.user_fields.filter(org=self.org, is_active=True)
+
+        self.assertListEqual([10, 0, 20], [cf.priority for cf in org_fields.order_by("id")])
+
+        self.login(self.admin)
+        updatepriority_cf_url = reverse("contacts.contactfield_update_priority")
+
+        post_data = '{invalid_json": 123}'
+
+        response = self.client.post(updatepriority_cf_url, post_data, content_type="application/json")
+        self.assertEqual(response.status_code, 400)
+        response_json = response.json()
+        self.assertEqual(response_json["status"], "ERROR")
+        self.assertEqual(
+            response_json["err_detail"], "Expecting property name enclosed in double quotes: line 1 column 2 (char 1)"
         )
 
     def test_contactfield_priority(self):
+        fields = ContactField.user_fields.filter(org=self.org).order_by("-priority", "id")
 
-        self.assertEqual(
-            list(ContactField.objects.order_by("-priority", "pk").values_list("label", flat=True)),
-            ["Third", "First", "Second"],
-        )
-        # change contactfield priority
+        self.assertEqual(["Third", "First", "Second"], list(fields.values_list("label", flat=True)))
+
+        # change field priority
         ContactField.get_or_create(org=self.org, user=self.user, key="first", priority=25)
-        self.assertEqual(
-            list(ContactField.objects.order_by("-priority", "pk").values_list("label", flat=True)),
-            ["First", "Third", "Second"],
+
+        self.assertEqual(["First", "Third", "Second"], list(fields.values_list("label", flat=True)))
+
+
+class ContactFieldCRUDLTest(TembaTest, CRUDLTestMixin):
+    def setUp(self):
+        super().setUp()
+
+        self.age = ContactField.get_or_create(self.org, self.admin, "age", "Age", value_type="N", show_in_table=True)
+        self.gender = ContactField.get_or_create(self.org, self.admin, "gender", "Gender", value_type="T")
+        self.state = ContactField.get_or_create(self.org, self.admin, "state", "State", value_type="S")
+
+        self.deleted = ContactField.get_or_create(self.org, self.admin, "foo", "Foo")
+        self.deleted.is_active = False
+        self.deleted.save(update_fields=("is_active",))
+
+        self.other_org_field = ContactField.get_or_create(self.org2, self.admin2, "other", "Other")
+
+    def test_list(self):
+        list_url = reverse("contacts.contactfield_list")
+
+        response = self.assertListFetch(
+            list_url, allow_viewers=False, allow_editors=True, context_objects=[self.age, self.gender, self.state]
         )
+        self.assertEqual(3, response.context["total_count"])
+        self.assertEqual(255, response.context["total_limit"])
+        self.assertNotContains(response, "You have reached the limit")
+        self.assertNotContains(response, "You are approaching the limit")
+
+        with override_settings(MAX_ACTIVE_CONTACTFIELDS_PER_ORG=10):
+            response = self.requestView(list_url, self.admin)
+
+            self.assertContains(response, "You are approaching the limit")
+
+        with override_settings(MAX_ACTIVE_CONTACTFIELDS_PER_ORG=3):
+            response = self.requestView(list_url, self.admin)
+
+            self.assertContains(response, "You have reached the limit")
 
     def test_json(self):
-        contact_field_json_url = reverse("contacts.contactfield_json")
+        json_url = reverse("contacts.contactfield_json")
 
-        self.org2 = Org.objects.create(
-            name="kLab", timezone="Africa/Kigali", created_by=self.admin, modified_by=self.admin
+        response = self.assertListFetch(json_url, allow_viewers=False, allow_editors=True)
+
+        self.assertEqual(
+            [
+                {"key": "name", "label": "Full name"},
+                {"key": "tel_e164", "label": "Phone number"},
+                {"key": "facebook", "label": "Facebook identifier"},
+                {"key": "twitter", "label": "Twitter handle"},
+                {"key": "twitterid", "label": "Twitter ID"},
+                {"key": "viber", "label": "Viber identifier"},
+                {"key": "line", "label": "LINE identifier"},
+                {"key": "telegram", "label": "Telegram identifier"},
+                {"key": "mailto", "label": "Email address"},
+                {"key": "ext", "label": "External identifier"},
+                {"key": "jiochat", "label": "JioChat identifier"},
+                {"key": "wechat", "label": "WeChat identifier"},
+                {"key": "fcm", "label": "Firebase Cloud Messaging identifier"},
+                {"key": "whatsapp", "label": "WhatsApp identifier"},
+                {"key": "freshchat", "label": "Freshchat identifier"},
+                {"key": "vk", "label": "VK identifier"},
+                {"key": "groups", "label": "Groups"},
+                {"id": self.age.id, "key": "age", "label": "Age"},
+                {"id": self.gender.id, "key": "gender", "label": "Gender"},
+                {"id": self.state.id, "key": "state", "label": "State"},
+            ],
+            response.json(),
         )
-        for i in range(30):
-            key = "key%d" % i
-            label = "label%d" % i
-            ContactField.get_or_create(self.org, self.admin, key, label)
-            ContactField.get_or_create(self.org2, self.admin, key, label)
-
-        self.assertEqual(Org.objects.all().count(), 2)
-
-        ContactField.objects.filter(org=self.org, key="key1").update(is_active=False)
-
-        self.login(self.non_org_user)
-        response = self.client.get(contact_field_json_url)
-
-        # redirect to login because of no access to org
-        self.assertEqual(302, response.status_code)
-
-        self.login(self.admin)
-        response = self.client.get(contact_field_json_url)
-
-        response_json = response.json()
-
-        self.assertEqual(len(response_json), 47)
-        self.assertEqual(response_json[0]["label"], "Full name")
-        self.assertEqual(response_json[0]["key"], "name")
-        self.assertEqual(response_json[1]["label"], "Phone number")
-        self.assertEqual(response_json[1]["key"], "tel_e164")
-        self.assertEqual(response_json[2]["label"], "Facebook identifier")
-        self.assertEqual(response_json[2]["key"], "facebook")
-        self.assertEqual(response_json[3]["label"], "Twitter handle")
-        self.assertEqual(response_json[3]["key"], "twitter")
-        self.assertEqual(response_json[4]["label"], "Twitter ID")
-        self.assertEqual(response_json[4]["key"], "twitterid")
-        self.assertEqual(response_json[5]["label"], "Viber identifier")
-        self.assertEqual(response_json[5]["key"], "viber")
-        self.assertEqual(response_json[6]["label"], "LINE identifier")
-        self.assertEqual(response_json[6]["key"], "line")
-        self.assertEqual(response_json[7]["label"], "Telegram identifier")
-        self.assertEqual(response_json[7]["key"], "telegram")
-        self.assertEqual(response_json[8]["label"], "Email address")
-        self.assertEqual(response_json[8]["key"], "mailto")
-        self.assertEqual(response_json[9]["label"], "External identifier")
-        self.assertEqual(response_json[9]["key"], "ext")
-        self.assertEqual(response_json[10]["label"], "Jiochat identifier")
-        self.assertEqual(response_json[10]["key"], "jiochat")
-        self.assertEqual(response_json[11]["label"], "WeChat identifier")
-        self.assertEqual(response_json[11]["key"], "wechat")
-        self.assertEqual(response_json[12]["label"], "Firebase Cloud Messaging identifier")
-        self.assertEqual(response_json[12]["key"], "fcm")
-        self.assertEqual(response_json[13]["label"], "WhatsApp identifier")
-        self.assertEqual(response_json[13]["key"], "whatsapp")
-        self.assertEqual(response_json[14]["label"], "Groups")
-        self.assertEqual(response_json[14]["key"], "groups")
-        self.assertEqual(response_json[15]["label"], "First")
-        self.assertEqual(response_json[15]["key"], "first")
-        self.assertEqual(response_json[16]["label"], "label0")
-        self.assertEqual(response_json[16]["key"], "key0")
-
-        ContactField.objects.filter(org=self.org, key="key0").update(label="AAAA")
-
-        response = self.client.get(contact_field_json_url)
-        response_json = response.json()
-
-        self.assertEqual(response_json[15]["label"], "AAAA")
-        self.assertEqual(response_json[15]["key"], "key0")
-        self.assertEqual(response_json[16]["label"], "First")
-        self.assertEqual(response_json[16]["key"], "first")
 
 
 class URNTest(TembaTest):
@@ -6928,10 +7142,23 @@ class URNTest(TembaTest):
         self.assertEqual("asdf", URN.fb_ref_from_path(URN.path_from_fb_ref("asdf")))
         self.assertTrue(URN.validate(URN.from_facebook(URN.path_from_fb_ref("asdf"))))
 
+    def test_vk_urn(self):
+        self.assertEqual("vk:12345", URN.from_vk("12345"))
+
     def test_whatsapp_urn(self):
         self.assertEqual("whatsapp:12065551212", URN.from_whatsapp("12065551212"))
         self.assertTrue(URN.validate("whatsapp:12065551212"))
         self.assertFalse(URN.validate("whatsapp:+12065551212"))
+
+    def test_freshchat_urn(self):
+        self.assertEqual(
+            "freshchat:c0534f78-b6e9-4f79-8853-11cedfc1f35b/c0534f78-b6e9-4f79-8853-11cedfc1f35b",
+            URN.from_freshchat("c0534f78-b6e9-4f79-8853-11cedfc1f35b/c0534f78-b6e9-4f79-8853-11cedfc1f35b"),
+        )
+        self.assertTrue(
+            URN.validate("freshchat:c0534f78-b6e9-4f79-8853-11cedfc1f35b/c0534f78-b6e9-4f79-8853-11cedfc1f35b")
+        )
+        self.assertFalse(URN.validate("freshchat:+12065551212"))
 
     def test_from_parts(self):
 
@@ -6950,6 +7177,7 @@ class URNTest(TembaTest):
         self.assertEqual(URN.from_twitter("abc_123"), "twitter:abc_123")
         self.assertEqual(URN.from_email("a_b+c@d.com"), "mailto:a_b+c@d.com")
         self.assertEqual(URN.from_facebook(12345), "facebook:12345")
+        self.assertEqual(URN.from_vk(12345), "vk:12345")
         self.assertEqual(URN.from_telegram(12345), "telegram:12345")
         self.assertEqual(URN.from_external("Aa0()+,-.:=@;$_!*'"), "ext:Aa0()+,-.:=@;$_!*'")
 
@@ -6964,6 +7192,7 @@ class URNTest(TembaTest):
         self.assertEqual(URN.to_parts("twitter:abc_123"), ("twitter", "abc_123", None, None))
         self.assertEqual(URN.to_parts("mailto:a_b+c@d.com"), ("mailto", "a_b+c@d.com", None, None))
         self.assertEqual(URN.to_parts("facebook:12345"), ("facebook", "12345", None, None))
+        self.assertEqual(URN.to_parts("vk:12345"), ("vk", "12345", None, None))
         self.assertEqual(URN.to_parts("telegram:12345"), ("telegram", "12345", None, None))
         self.assertEqual(URN.to_parts("telegram:12345#foobar"), ("telegram", "12345", None, "foobar"))
         self.assertEqual(URN.to_parts("ext:Aa0()+,-.:=@;$_!*'"), ("ext", "Aa0()+,-.:=@;$_!*'", None, None))
@@ -7039,11 +7268,12 @@ class URNTest(TembaTest):
         # viber urn
         self.assertTrue(URN.validate("viber:dKPvqVrLerGrZw15qTuVBQ=="))
 
-        # facebook and telegram URN paths must be integers
+        # facebook, telegram vk URN paths must be integers
         self.assertTrue(URN.validate("telegram:12345678901234567"))
         self.assertFalse(URN.validate("telegram:abcdef"))
         self.assertTrue(URN.validate("facebook:12345678901234567"))
         self.assertFalse(URN.validate("facebook:abcdef"))
+        self.assertTrue(URN.validate("vk:12345678901234567"))
 
 
 class PhoneNumberTest(TestCase):
@@ -7064,7 +7294,7 @@ class PhoneNumberTest(TestCase):
         self.assertEqual(is_phonenumber('(social = "234-432-324")'), (False, None))
 
 
-class ESIntegrationTest(TembaTestMixin, SmartminTestMixin, TransactionTestCase):
+class ESIntegrationTest(TembaNonAtomicTest):
     def test_ES_contacts_index(self):
         self.create_anonymous_user()
         self.admin = self.create_user("Administrator")
@@ -7096,9 +7326,6 @@ class ESIntegrationTest(TembaTestMixin, SmartminTestMixin, TransactionTestCase):
 
         self.client.login(username=self.admin.username, password=self.admin.username)
 
-        # block the default contacts, these should be ignored in our searches
-        Contact.objects.all().update(is_active=False, is_blocked=True)
-
         age = ContactField.get_or_create(self.org, self.admin, "age", "Age", value_type="N")
         ContactField.get_or_create(self.org, self.admin, "join_date", "Join Date", value_type="D")
         ContactField.get_or_create(self.org, self.admin, "state", "Home State", value_type="S")
@@ -7109,16 +7336,19 @@ class ESIntegrationTest(TembaTestMixin, SmartminTestMixin, TransactionTestCase):
         ContactField.get_or_create(self.org, self.admin, "hasbirth", "Has Birth", value_type="T")
 
         names = ["Trey", "Mike", "Paige", "Fish", "", None]
-        districts = ["Gatsibo", "Kayônza", "Rwamagana"]
-        wards = ["Kageyo", "Kabara", "Bukure"]
-        date_format = get_datetime_format(True)[0]
+        districts = ["Gatsibo", "Kayônza", "Rwamagana", None]
+        wards = ["Kageyo", "Kabara", "Bukure", None]
+        date_format = self.org.get_datetime_formats()[0]
+
+        # reset contact ids so we don't get unexpected collisions with phone numbers
+        with connection.cursor() as cursor:
+            cursor.execute("""SELECT setval(pg_get_serial_sequence('"contacts_contact"','id'), 900)""")
 
         # create some contacts
-
         for i in range(90):
             name = names[i % len(names)]
 
-            number = "0788382%s" % str(i).zfill(3)
+            number = "0188382%s" % str(i).zfill(3)
             twitter = ("tweep_%d" % (i + 1)) if (i % 3 == 0) else None  # 1 in 3 have twitter URN
             contact = self.create_contact(name=name, number=number, twitter=twitter)
             join_date = datetime_to_str(date(2014, 1, 1) + timezone.timedelta(days=i), date_format, tz=pytz.utc)
@@ -7130,21 +7360,22 @@ class ESIntegrationTest(TembaTestMixin, SmartminTestMixin, TransactionTestCase):
             contact.set_field(self.admin, "home", districts[i % len(districts)])
             contact.set_field(self.admin, "ward", wards[i % len(wards)])
 
-            contact.set_field(self.admin, "isureporter", "yes")
+            contact.set_field(self.admin, "isureporter", "yes" if i % 2 == 0 else "no" if i % 3 == 0 else None)
             contact.set_field(self.admin, "hasbirth", "no")
 
             if i % 3 == 0:
                 contact.set_field(self.admin, "profession", "Farmer")  # only some contacts have any value for this
 
         def q(query):
-            search_object, _ = contact_es_search(self.org, query, None)
-            return search_object.source(fields=("id",)).using(ES).count()
+            results = search_contacts(self.org.id, self.org.cached_all_contacts_group.uuid, query, None)
+            return results.total
 
-        db_config = settings.DATABASES["default"]
+        db_config = connection.settings_dict
         database_url = (
             f"postgres://{db_config['USER']}:{db_config['PASSWORD']}@{db_config['HOST']}:{db_config['PORT']}/"
             f"{db_config['NAME']}?sslmode=disable"
         )
+        print(f"Using database: {database_url}")
 
         result = subprocess.run(
             ["./rp-indexer", "-elastic-url", settings.ELASTICSEARCH_URL, "-db", database_url, "-rebuild"],
@@ -7159,8 +7390,8 @@ class ESIntegrationTest(TembaTestMixin, SmartminTestMixin, TransactionTestCase):
         self.assertEqual(q("trey"), 15)
         self.assertEqual(q("MIKE"), 15)
         self.assertEqual(q("  paige  "), 15)
-        self.assertEqual(q("0788382011"), 1)
-        self.assertEqual(q("trey 0788382"), 15)
+        self.assertEqual(q("0188382011"), 1)
+        self.assertEqual(q("trey 0188382"), 15)
 
         # name as property
         self.assertEqual(q('name is "trey"'), 15)
@@ -7169,10 +7400,11 @@ class ESIntegrationTest(TembaTestMixin, SmartminTestMixin, TransactionTestCase):
         self.assertEqual(q('name != ""'), 60)
         self.assertEqual(q('NAME = ""'), 30)
         self.assertEqual(q("name ~ Mi"), 15)
+        self.assertEqual(q('name != "Mike"'), 75)
 
         # URN as property
-        self.assertEqual(q("tel is +250788382011"), 1)
-        self.assertEqual(q("tel has 0788382011"), 1)
+        self.assertEqual(q("tel is +250188382011"), 1)
+        self.assertEqual(q("tel has 0188382011"), 1)
         self.assertEqual(q("twitter = tweep_13"), 1)
         self.assertEqual(q('twitter = ""'), 60)
         self.assertEqual(q('twitter != ""'), 30)
@@ -7195,18 +7427,20 @@ class ESIntegrationTest(TembaTestMixin, SmartminTestMixin, TransactionTestCase):
         self.assertEqual(q('join_date = ""'), 0)
 
         self.assertEqual(q('state is "Eastern Province"'), 90)
-        self.assertEqual(q("HOME is Kayônza"), 30)
-        self.assertEqual(q("ward is kageyo"), 30)
+        self.assertEqual(q("HOME is Kayônza"), 23)
+        self.assertEqual(q("ward is kageyo"), 23)
+        self.assertEqual(q("ward != kageyo"), 67)  # includes objects with empty ward
 
-        self.assertEqual(q('home is ""'), 0)
+        self.assertEqual(q('home is ""'), 22)
         self.assertEqual(q('profession = ""'), 60)
         self.assertEqual(q('profession is ""'), 60)
         self.assertEqual(q('profession != ""'), 30)
 
         # contact fields beginning with 'is' or 'has'
-        self.assertEqual(q('isureporter = "yes"'), 90)
-        self.assertEqual(q("isureporter = yes"), 90)
-        self.assertEqual(q("isureporter = no"), 0)
+        self.assertEqual(q('isureporter = "yes"'), 45)
+        self.assertEqual(q("isureporter = yes"), 45)
+        self.assertEqual(q("isureporter = no"), 15)
+        self.assertEqual(q("isureporter != no"), 75)  # includes objects with empty isureporter
 
         self.assertEqual(q('hasbirth = "no"'), 90)
         self.assertEqual(q("hasbirth = no"), 90)
@@ -7215,7 +7449,7 @@ class ESIntegrationTest(TembaTestMixin, SmartminTestMixin, TransactionTestCase):
         # boolean combinations
         self.assertEqual(q("name is trey or name is mike"), 30)
         self.assertEqual(q("name is trey and age < 20"), 2)
-        self.assertEqual(q('(home is gatsibo or home is "Rwamagana")'), 60)
+        self.assertEqual(q('(home is gatsibo or home is "Rwamagana")'), 45)
         self.assertEqual(q('(home is gatsibo or home is "Rwamagana") and name is trey'), 15)
         self.assertEqual(q('name is MIKE and profession = ""'), 15)
         self.assertEqual(q("profession = doctor or profession = farmer"), 30)  # same field
@@ -7225,24 +7459,43 @@ class ESIntegrationTest(TembaTestMixin, SmartminTestMixin, TransactionTestCase):
         # create contact with no phone number, we'll try searching for it by id
         contact = self.create_contact(name="Id Contact")
 
-        # non-anon orgs can't search by id (because they never see ids)
-        self.assertEqual(q("%d" % contact.pk), 0)  # others may match by id on tel
+        # a new contact was created, execute the rp-indexer again
+        result = subprocess.run(
+            ["./rp-indexer", "-elastic-url", settings.ELASTICSEARCH_URL, "-db", database_url, "-rebuild"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(result.returncode, 0, "Command failed: %s\n\n%s" % (result.stdout, result.stderr))
+
+        # give ES some time to publish the results
+        time.sleep(5)
+
+        # NOTE: when this fails with `AssertionError: 90 != 0`, check if contact phone numbers might match
+        # NOTE: for example id=2507, tel=250788382011 ... will match
+        # non-anon orgs can't search by id (because they never see ids), but they match on tel
+        self.assertEqual(q("%d" % contact.pk), 0)
 
         with AnonymousOrg(self.org):
+            # give mailroom time to clear its org cache
+            time.sleep(5)
+
             # still allow name and field searches
             self.assertEqual(q("trey"), 15)
             self.assertEqual(q("name is mike"), 15)
             self.assertEqual(q("age > 30"), 69)
 
             # don't allow matching on URNs
-            self.assertEqual(q("0788382011"), 0)
-            self.assertEqual(q("tel is +250788382011"), 0)
-            self.assertEqual(q("twitter has tweep"), 0)
-            self.assertEqual(q('twitter = ""'), 0)
+            self.assertEqual(q("0188382011"), 0)
+            self.assertRaises(SearchException, q, "tel is +250188382011")
+            self.assertRaises(SearchException, q, "twitter has tweep")
+            self.assertRaises(SearchException, q, 'twitter = ""')
 
             # anon orgs can search by id, with or without zero padding
-            self.assertEqual(q("%d" % contact.pk), 0)
-            self.assertEqual(q("%010d" % contact.pk), 0)
+            self.assertEqual(q("%d" % contact.pk), 1)
+            self.assertEqual(q("%010d" % contact.pk), 1)
+
+        # give mailroom time to clear its org cache
+        time.sleep(5)
 
         # invalid queries
         self.assertRaises(SearchException, q, "((")
@@ -7257,7 +7510,7 @@ class ESIntegrationTest(TembaTestMixin, SmartminTestMixin, TransactionTestCase):
         self.assertRaises(SearchException, q, "join_date > xxxxx")  # unparseable date-field comparison
         self.assertRaises(SearchException, q, "home > kigali")  # unrecognized location-field operator
         self.assertRaises(SearchException, q, "credits > 10")  # non-existent field or attribute
-        self.assertRaises(SearchException, q, "tel < +250788382011")  # unsupported comparator for a URN   # ValueError
+        self.assertRaises(SearchException, q, "tel < +250188382011")  # unsupported comparator for a URN   # ValueError
         self.assertRaises(SearchException, q, 'tel < ""')  # unsupported comparator for an empty string
         self.assertRaises(SearchException, q, "data=“not empty”")  # unicode “,” are not accepted characters
 
@@ -7266,16 +7519,16 @@ class ESIntegrationTest(TembaTestMixin, SmartminTestMixin, TransactionTestCase):
         self.login(self.admin)
 
         response = self.client.get("%s?sort_on=%s" % (url, "created_on"))
-        self.assertEqual(response.context["contacts"][0].name, "Trey")  # first contact in the set
-        self.assertEqual(response.context["contacts"][0].fields[str(age.uuid)], {"text": "10", "number": "10"})
+        self.assertEqual(response.context["object_list"][0].name, "Trey")  # first contact in the set
+        self.assertEqual(response.context["object_list"][0].fields[str(age.uuid)], {"text": "10", "number": "10"})
 
         response = self.client.get("%s?sort_on=-%s" % (url, "created_on"))
-        self.assertEqual(response.context["contacts"][0].name, None)  # last contact in the set
-        self.assertEqual(response.context["contacts"][0].fields[str(age.uuid)], {"text": "99", "number": "99"})
+        self.assertEqual(response.context["object_list"][0].name, "Id Contact")  # last contact in the set
+        self.assertEqual(response.context["object_list"][0].fields, None)
 
-        response = self.client.get("%s?sort_on=-%s" % (url, str(ward.uuid)))
+        response = self.client.get("%s?sort_on=-%s" % (url, str(ward.key)))
         self.assertEqual(
-            response.context["contacts"][0].fields[str(ward.uuid)],
+            response.context["object_list"][0].fields[str(ward.uuid)],
             {
                 "district": "Rwanda > Eastern Province > Gatsibo",
                 "state": "Rwanda > Eastern Province",
@@ -7284,9 +7537,9 @@ class ESIntegrationTest(TembaTestMixin, SmartminTestMixin, TransactionTestCase):
             },
         )
 
-        response = self.client.get("%s?sort_on=%s" % (url, str(ward.uuid)))
+        response = self.client.get("%s?sort_on=%s" % (url, str(ward.key)))
         self.assertEqual(
-            response.context["contacts"][0].fields[str(ward.uuid)],
+            response.context["object_list"][0].fields[str(ward.uuid)],
             {
                 "district": "Rwanda > Eastern Province > Rwamagana",
                 "state": "Rwanda > Eastern Province",
@@ -7294,3 +7547,38 @@ class ESIntegrationTest(TembaTestMixin, SmartminTestMixin, TransactionTestCase):
                 "ward": "Rwanda > Eastern Province > Rwamagana > Bukure",
             },
         )
+
+        # create a dynamic group on age
+        self.login(self.admin)
+        url = reverse("contacts.contactgroup_create")
+        self.client.post(url, dict(name="Adults", group_query="age > 30"))
+
+        time.sleep(5)
+
+        # check that it was created with the right counts
+        adults = ContactGroup.user_groups.get(org=self.org, name="Adults")
+        self.assertEqual(69, adults.get_member_count())
+
+        # create a campaign and event on this group
+        campaign = Campaign.create(self.org, self.admin, "Cake Day", adults)
+        created_on = ContactField.all_fields.get(org=self.org, key="created_on")
+        event = CampaignEvent.create_message_event(
+            self.org, self.admin, campaign, relative_to=created_on, offset=12, unit="M", message="Happy One Year!"
+        )
+        # rapidpro creation of events
+        EventFire.create_eventfires_for_event(event)
+
+        # should have 69 events
+        EventFire.objects.filter(event=event, fired=None).count()
+
+        # update the query
+        url = reverse("contacts.contactgroup_update", args=[adults.id])
+        response = self.client.post(url, dict(name="Adults", query="age > 18"))
+
+        time.sleep(5)
+
+        # should have updated count
+        self.assertEqual(81, adults.get_member_count())
+
+        # should now have 81 events instead, these were created by mailroom
+        self.assertEqual(81, EventFire.objects.filter(event=event, fired=None).count())

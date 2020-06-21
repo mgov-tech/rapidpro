@@ -33,11 +33,11 @@ def validate_translations(value, base_language, max_length):
             raise serializers.ValidationError("Ensure translations have no more than %d characters." % max_length)
 
 
-def validate_urn(value, strict=True):
+def validate_urn(value, strict=True, country_code=None):
     try:
-        normalized = URN.normalize(value)
+        normalized = URN.normalize(value, country_code=country_code)
 
-        if strict and not URN.validate(normalized):
+        if strict and not URN.validate(normalized, country_code=country_code):
             raise ValueError()
     except ValueError:
         raise serializers.ValidationError("Invalid URN: %s. Ensure phone numbers contain country codes." % value)
@@ -108,7 +108,8 @@ class URNField(serializers.CharField):
             return str(obj)
 
     def to_internal_value(self, data):
-        return validate_urn(data)
+        country_code = self.context["org"].get_country_code()
+        return validate_urn(str(data), country_code=country_code)
 
 
 class URNListField(LimitedListField):
@@ -119,7 +120,12 @@ class TembaModelField(serializers.RelatedField):
     model = None
     model_manager = "objects"
     lookup_fields = ("uuid",)
+
+    # lookup fields which should be matched case-insensitively
     ignore_case_for_fields = ()
+
+    # throw validation exception if any object not found, otherwise returns none
+    require_exists = True
 
     class LimitedSizeList(serializers.ManyRelatedField):
         def run_validation(self, data=serializers.empty):
@@ -160,7 +166,7 @@ class TembaModelField(serializers.RelatedField):
 
         obj = self.get_object(data)
 
-        if not obj:
+        if self.require_exists and not obj:
             raise serializers.ValidationError("No such object: %s" % data)
 
         return obj
@@ -168,6 +174,10 @@ class TembaModelField(serializers.RelatedField):
 
 class CampaignField(TembaModelField):
     model = Campaign
+
+    def get_queryset(self):
+        manager = getattr(self.model, self.model_manager)
+        return manager.filter(org=self.context["org"], is_active=True, is_archived=False)
 
 
 class CampaignEventField(TembaModelField):
@@ -185,13 +195,24 @@ class ContactField(TembaModelField):
     model = Contact
     lookup_fields = ("uuid", "urns__urn")
 
+    def __init__(self, **kwargs):
+        self.with_urn = kwargs.pop("with_urn", False)
+        super().__init__(**kwargs)
+
+    def to_representation(self, obj):
+        if self.with_urn and not self.context["org"].is_anon:
+            urn = obj.urns.first()
+            return {"uuid": obj.uuid, "urn": urn.identity if urn else None, "name": obj.name}
+
+        return {"uuid": obj.uuid, "name": obj.name}
+
     def get_queryset(self):
-        return self.model.objects.filter(org=self.context["org"], is_active=True, is_test=False)
+        return self.model.objects.filter(org=self.context["org"], is_active=True)
 
     def get_object(self, value):
         # try to normalize as URN but don't blow up if it's a UUID
         try:
-            as_urn = URN.identity(URN.normalize(value))
+            as_urn = URN.identity(URN.normalize(str(value)))
         except ValueError:
             as_urn = value
 
@@ -206,6 +227,10 @@ class ContactFieldField(TembaModelField):
 
     def to_representation(self, obj):
         return {"key": obj.key, "label": obj.label}
+
+    def get_queryset(self):
+        manager = getattr(self.model, "all_fields")
+        return manager.filter(org=self.context["org"], is_active=True)
 
 
 class ContactGroupField(TembaModelField):
@@ -242,7 +267,8 @@ class MessageField(TembaModelField):
     model = Msg
     lookup_fields = ("id",)
 
+    # messages get archived automatically so don't error if a message doesn't exist
+    require_exists = False
+
     def get_queryset(self):
-        return self.model.objects.filter(org=self.context["org"], contact__is_test=False).exclude(
-            visibility=Msg.VISIBILITY_DELETED
-        )
+        return self.model.objects.filter(org=self.context["org"]).exclude(visibility=Msg.VISIBILITY_DELETED)

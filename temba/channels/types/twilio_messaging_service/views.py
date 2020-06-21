@@ -1,13 +1,12 @@
-
 from smartmin.views import SmartFormView
-from twilio import TwilioRestException
+from twilio.base.exceptions import TwilioRestException
 
 from django import forms
 from django.http import HttpResponseRedirect
 from django.urls import reverse
 from django.utils.translation import ugettext_lazy as _
 
-from temba.orgs.models import ACCOUNT_SID, ACCOUNT_TOKEN
+from temba.orgs.models import Org
 
 from ...models import Channel
 from ...views import TWILIO_SUPPORTED_COUNTRIES, ClaimViewMixin
@@ -34,7 +33,7 @@ class ClaimView(ClaimViewMixin, SmartFormView):
             self.client = org.get_twilio_client()
             if not self.client:
                 return HttpResponseRedirect(reverse("orgs.org_twilio_connect"))
-            self.account = self.client.accounts.get(org.config[ACCOUNT_SID])
+            self.account = self.client.api.account.fetch()
         except TwilioRestException:
             return HttpResponseRedirect(reverse("orgs.org_twilio_connect"))
 
@@ -55,8 +54,8 @@ class ClaimView(ClaimViewMixin, SmartFormView):
         org_config = org.config
         config = {
             Channel.CONFIG_MESSAGING_SERVICE_SID: data["messaging_service_sid"],
-            Channel.CONFIG_ACCOUNT_SID: org_config[ACCOUNT_SID],
-            Channel.CONFIG_AUTH_TOKEN: org_config[ACCOUNT_TOKEN],
+            Channel.CONFIG_ACCOUNT_SID: org_config[Org.CONFIG_TWILIO_SID],
+            Channel.CONFIG_AUTH_TOKEN: org_config[Org.CONFIG_TWILIO_TOKEN],
             Channel.CONFIG_CALLBACK_DOMAIN: org.get_brand_domain(),
         }
 

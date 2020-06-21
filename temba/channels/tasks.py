@@ -1,86 +1,27 @@
-
 import logging
-import time
 from datetime import timedelta
-from enum import Enum
 
-from django_redis import get_redis_connection
+import pytz
 
 from django.conf import settings
+from django.db.models import Sum
 from django.utils import timezone
 
 from celery.task import task
 
-from temba.msgs.models import MSG_QUEUE, SEND_MSG_TASK
-from temba.utils import dict_to_struct
-from temba.utils.mage import MageClient
-from temba.utils.queues import complete_task, nonoverlapping_task, push_task, start_task
+from temba.orgs.models import Org
+from temba.utils.analytics import track
+from temba.utils.celery import nonoverlapping_task
 
-from .models import Alert, Channel, ChannelCount, ChannelLog
+from .models import Alert, Channel, ChannelCount, ChannelLog, SyncEvent
 
 logger = logging.getLogger(__name__)
-
-
-class MageStreamAction(Enum):
-    activate = 1
-    refresh = 2
-    deactivate = 3
-
-
-@task(track_started=True, name="sync_channel_gcm_task")
-def sync_channel_gcm_task(cloud_registration_id, channel_id=None):  # pragma: no cover
-    channel = Channel.objects.filter(pk=channel_id).first()
-    Channel.sync_channel_gcm(cloud_registration_id, channel)
 
 
 @task(track_started=True, name="sync_channel_fcm_task")
 def sync_channel_fcm_task(cloud_registration_id, channel_id=None):  # pragma: no cover
     channel = Channel.objects.filter(pk=channel_id).first()
     Channel.sync_channel_fcm(cloud_registration_id, channel)
-
-
-@task(track_started=True, name="send_msg_task")
-def send_msg_task():
-    """
-    Pops the next message off of our msg queue to send.
-    """
-    # pop off the next task
-    org_id, msg_tasks = start_task(SEND_MSG_TASK)
-
-    # it is possible we have no message to send, if so, just return
-    if not msg_tasks:  # pragma: needs cover
-        return
-
-    if not isinstance(msg_tasks, list):  # pragma: needs cover
-        msg_tasks = [msg_tasks]
-
-    r = get_redis_connection()
-
-    # acquire a lock on our contact to make sure two sets of msgs aren't being sent at the same time
-    try:
-        with r.lock("send_contact_%d" % msg_tasks[0]["contact"], timeout=300):
-            # send each of our msgs
-            while msg_tasks:
-                msg_task = msg_tasks.pop(0)
-                msg = dict_to_struct(
-                    "MockMsg",
-                    msg_task,
-                    datetime_fields=["modified_on", "sent_on", "created_on", "queued_on", "next_attempt"],
-                )
-                Channel.send_message(msg)
-
-                # if there are more messages to send for this contact, sleep a second before moving on
-                if msg_tasks:
-                    time.sleep(1)
-
-    finally:  # pragma: no cover
-        # mark this worker as done
-        complete_task(SEND_MSG_TASK, org_id)
-
-        # if some msgs weren't sent for some reason, then requeue them for later sending
-        if msg_tasks:
-            # requeue any unsent msgs
-            push_task(org_id, MSG_QUEUE, SEND_MSG_TASK, msg_tasks)
 
 
 @nonoverlapping_task(track_started=True, name="check_channels_task", lock_key="check_channels")
@@ -92,10 +33,32 @@ def check_channels_task():
     Alert.check_alerts()
 
 
+@nonoverlapping_task(track_started=True, name="sync_old_seen_channels_task", lock_key="sync_old_seen_channels")
+def sync_old_seen_channels_task():
+    from temba.channels.types.android import AndroidType
+
+    now = timezone.now()
+    window_end = now - timedelta(minutes=15)
+    window_start = now - timedelta(days=7)
+    old_seen_channels = Channel.objects.filter(
+        is_active=True, channel_type=AndroidType.code, last_seen__lte=window_end, last_seen__gt=window_start
+    )
+    for channel in old_seen_channels:
+        channel.trigger_sync()
+
+
 @task(track_started=True, name="send_alert_task")
 def send_alert_task(alert_id, resolved):
     alert = Alert.objects.get(pk=alert_id)
     alert.send_email(resolved)
+
+
+@nonoverlapping_task(track_started=True, name="trim_sync_events_task")
+def trim_sync_events_task():  # pragma: needs cover
+    """
+    Runs daily and clears any channel sync events that are older than 7 days
+    """
+    SyncEvent.trim()
 
 
 @nonoverlapping_task(track_started=True, name="trim_channel_log_task")
@@ -119,22 +82,39 @@ def trim_channel_log_task():  # pragma: needs cover
         ChannelLog.objects.filter(created_on__lte=all_log_later).delete()
 
 
-@task(track_started=True, name="notify_mage_task")
-def notify_mage_task(channel_uuid, action):
-    """
-    Notifies Mage of a change to a Twitter channel
-    """
-    action = MageStreamAction[action]
-    mage = MageClient(settings.MAGE_API_URL, settings.MAGE_AUTH_TOKEN)
-
-    if action == MageStreamAction.activate:
-        mage.activate_twitter_stream(channel_uuid)
-    elif action == MageStreamAction.deactivate:
-        mage.deactivate_twitter_stream(channel_uuid)
-    else:  # pragma: no cover
-        raise ValueError("Invalid action: %s" % action)
-
-
-@nonoverlapping_task(track_started=True, name="squash_channelcounts", lock_key="squash_channelcounts")
+@nonoverlapping_task(
+    track_started=True, name="squash_channelcounts", lock_key="squash_channelcounts", lock_timeout=7200
+)
 def squash_channelcounts():
     ChannelCount.squash()
+
+
+@nonoverlapping_task(
+    track_started=True, name="track_org_channel_counts", lock_key="track_org_channel_counts", lock_timeout=7200
+)
+def track_org_channel_counts(now=None):
+    """
+    Run daily, logs to our analytics the number of incoming and outgoing messages/ivr messages per org that had
+    more than one message received or sent in the previous day. This helps track engagement of orgs.
+    """
+    now = now or timezone.now()
+    yesterday = (now.astimezone(pytz.utc) - timedelta(days=1)).date()
+
+    stats = [
+        dict(key="temba.msg_incoming", count_type=ChannelCount.INCOMING_MSG_TYPE),
+        dict(key="temba.msg_outgoing", count_type=ChannelCount.OUTGOING_MSG_TYPE),
+        dict(key="temba.ivr_incoming", count_type=ChannelCount.INCOMING_IVR_TYPE),
+        dict(key="temba.ivr_outgoing", count_type=ChannelCount.OUTGOING_IVR_TYPE),
+    ]
+
+    # calculate each stat and track
+    for stat in stats:
+        org_counts = (
+            Org.objects.filter(
+                channels__counts__day=yesterday, channels__counts__count_type=stat["count_type"]
+            ).annotate(count=Sum("channels__counts__count"))
+        ).prefetch_related("administrators")
+
+        for org in org_counts:
+            if org.administrators.all():
+                track(org.administrators.all()[0].email, stat["key"], dict(count=org.count))

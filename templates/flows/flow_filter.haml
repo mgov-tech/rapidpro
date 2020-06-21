@@ -32,6 +32,13 @@
 
       %a#delete-form.posterize{href:'{% url "flows.flowlabel_delete" current_label.pk %}'}
 
+    .deletion-fail.hide
+      .title
+        -trans "Remove Label"
+
+      .body
+        %p
+          -trans "You cannot remove a label which has child labels. Please remove all children first."
 
 -block extra-script
   {{ block.super }}
@@ -39,20 +46,30 @@
   :javascript
         
     {% if org_perms.flows.flowlabel_delete %}
-    $(".remove-label").live('click', function(){
-      modal = new ConfirmationModal($('.deletion > .title').html(), $('.deletion > .body').html());
-      modal.addClass('alert');
-      modal.setListeners({onPrimary: function(){
-        $('#delete-form').click();
-      }}, false);
-      modal.setPrimaryButton('{% trans "Remove" %}');
-      modal.show();
-    });
+      {% if not current_label.children.all %}
+      $(".remove-label").live('click', function(){
+        modal = new ConfirmationModal($('.deletion > .title').html(), $('.deletion > .body').html());
+        modal.addClass('alert');
+        modal.setListeners({onPrimary: function(){
+          $('#delete-form').click();
+        }}, false);
+        modal.setPrimaryButton('{{ _("Remove")|escapejs }}');
+        modal.show();
+      });
+      {% else %}
+      $(".remove-label").live('click', function(){
+        modal = new Modal($('.deletion-fail > .title').html(), $('.deletion-fail > .body').html());
+        modal.addClass('alert');
+        modal.setListeners(function(){}, true);
+        modal.setPrimaryButton('{{ _("Ok")|escapejs }}');
+        modal.show();
+      });
+      {% endif %}
     {% endif %}
 
     {% if org_perms.flows.flowlabel_update %}
     $(".page-content").on('click', ".label-update-btn", function() {
-      var modal = new Modax('{% trans "Update Label" %}', '{% url "flows.flowlabel_update" current_label.pk %}')
+      var modal = new Modax('{{ _("Update Label")|escapejs }}', '{% url "flows.flowlabel_update" current_label.pk %}')
       modal.setIcon('icon-tag');
       modal.setListeners({
         onFormLoaded: function() {

@@ -1,14 +1,16 @@
 import base64
 import hashlib
 import hmac
-import json
+import logging
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta
 
+import nexmo
 import phonenumbers
 import pytz
 import requests
+import twilio.base.exceptions
 from django_countries.data import COUNTRIES
 from smartmin.views import (
     SmartCRUDL,
@@ -20,38 +22,53 @@ from smartmin.views import (
     SmartTemplateView,
     SmartUpdateView,
 )
-from twilio import TwilioRestException
+from twilio.base.exceptions import TwilioException, TwilioRestException
 
 from django import forms
 from django.conf import settings
 from django.contrib import messages
 from django.core.exceptions import ValidationError
-from django.core.urlresolvers import reverse
 from django.db.models import Count, Sum
 from django.http import Http404, HttpResponse, HttpResponseRedirect, JsonResponse
+from django.shortcuts import get_object_or_404
+from django.urls import reverse
 from django.utils import timezone
 from django.utils.encoding import force_bytes, force_text
 from django.utils.http import urlencode
 from django.utils.translation import ugettext_lazy as _
 from django.views.decorators.csrf import csrf_exempt
 
-from temba.channels.models import ChannelSession
-from temba.contacts.models import TEL_SCHEME, URN, ContactURN
+from temba.contacts.models import TEL_SCHEME, URN
 from temba.msgs.models import OUTGOING, PENDING, QUEUED, WIRED, Msg, SystemLabel
 from temba.msgs.views import InboxView
 from temba.orgs.models import Org
 from temba.orgs.views import AnonMixin, ModalMixin, OrgObjPermsMixin, OrgPermsMixin
-from temba.utils import analytics
+from temba.utils import analytics, json
 from temba.utils.http import http_headers
+from temba.utils.models import patch_queryset_count
 
-from .models import Alert, Channel, ChannelCount, ChannelEvent, ChannelLog, SyncEvent
+from .models import (
+    Alert,
+    Channel,
+    ChannelConnection,
+    ChannelCount,
+    ChannelEvent,
+    ChannelLog,
+    SyncEvent,
+    UnsupportedAndroidChannelError,
+)
+
+logger = logging.getLogger(__name__)
 
 COUNTRIES_NAMES = {key: value for key, value in COUNTRIES.items()}
 COUNTRIES_NAMES["GB"] = _("United Kingdom")
 COUNTRIES_NAMES["US"] = _("United States")
+COUNTRIES_NAMES["AC"] = _("Scension Island")
+COUNTRIES_NAMES["XK"] = _("Kosovo")
 
 
 COUNTRY_CALLING_CODES = {
+    "AC": (247,),  # Scension Island
     "AF": (93,),  # Afghanistan
     "AX": (35818,),  # Åland Islands
     "AL": (355,),  # Albania
@@ -98,8 +115,8 @@ COUNTRY_CALLING_CODES = {
     "TD": (235,),  # Chad
     "CL": (56,),  # Chile
     "CN": (86,),  # China
-    "CX": (6189164,),  # Christmas Island
-    "CC": (6189162,),  # Cocos (Keeling) Islands
+    "CX": (6_189_164,),  # Christmas Island
+    "CC": (6_189_162,),  # Cocos (Keeling) Islands
     "CO": (57,),  # Colombia
     "KM": (269,),  # Comoros
     "CD": (243,),  # Congo (the Democratic Republic of the)
@@ -143,13 +160,13 @@ COUNTRY_CALLING_CODES = {
     "GP": (590,),  # Guadeloupe
     "GU": (1671,),  # Guam
     "GT": (502,),  # Guatemala
-    "GG": (441481, 447781, 447839, 447911),  # Guernsey
+    "GG": (441_481, 447_781, 447_839, 447_911),  # Guernsey
     "GN": (224,),  # Guinea
     "GW": (245,),  # Guinea-Bissau
     "GY": (592,),  # Guyana
     "HT": (509,),  # Haiti
     "HM": (),  # Heard Island and McDonald Islands
-    "VA": (379, 3906698),  # Holy See
+    "VA": (379, 3_906_698),  # Holy See
     "HN": (504,),  # Honduras
     "HK": (852,),  # Hong Kong
     "HU": (36,),  # Hungary
@@ -159,12 +176,12 @@ COUNTRY_CALLING_CODES = {
     "IR": (98,),  # Iran (Islamic Republic of)
     "IQ": (964,),  # Iraq
     "IE": (353,),  # Ireland
-    "IM": (441624, 447524, 447624, 447924),  # Isle of Man
+    "IM": (441_624, 447_524, 447_624, 447_924),  # Isle of Man
     "IL": (972,),  # Israel
     "IT": (39,),  # Italy
     "JM": (1876,),  # Jamaica
     "JP": (81,),  # Japan
-    "JE": (441534,),  # Jersey
+    "JE": (441_534,),  # Jersey
     "JO": (962,),  # Jordan
     "KZ": (76, 77),  # Kazakhstan
     "KE": (254,),  # Kenya
@@ -194,7 +211,7 @@ COUNTRY_CALLING_CODES = {
     "MQ": (596,),  # Martinique
     "MR": (222,),  # Mauritania
     "MU": (230,),  # Mauritius
-    "YT": (262269, 262639),  # Mayotte
+    "YT": (262_269, 262_639),  # Mayotte
     "MX": (52,),  # Mexico
     "FM": (691,),  # Micronesia (Federated States of)
     "MD": (373,),  # Moldova (the Republic of)
@@ -298,6 +315,7 @@ COUNTRY_CALLING_CODES = {
     "VI": (),  # Virgin Islands (U.S.)
     "WF": (681,),  # Wallis and Futuna
     "EH": (),  # Western Sahara
+    "XK": (383,),  # Kosovo
     "YE": (967,),  # Yemen
     "ZM": (260,),  # Zambia
     "ZW": (263,),  # Zimbabwe
@@ -351,92 +369,230 @@ TWILIO_SUPPORTED_COUNTRY_CODES = list(
 )
 
 NEXMO_SUPPORTED_COUNTRIES_CONFIG = (
-    "DZ",  # Algeria
+    "AC",  # scension Island
+    "AD",  # Andorra
+    "AE",  # United Arab Emirates
+    "AF",  # Afghanistan
+    "AG",  # Antigua and Barbuda
+    "AI",  # Anguilla
+    "AL",  # Albania
+    "AM",  # Armenia
+    "AO",  # Angola
     "AR",  # Argentina
-    "AU",  # Australia
+    "AS",  # American Samoa
     "AT",  # Austria
-    "BH",  # Bahrain
+    "AU",  # Australia
+    "AW",  # Aruba
+    "AZ",  # Azerbaijan
+    "BA",  # Bosnia and Herzegovina
+    "BB",  # Barbados
+    "BD",  # Bangladesh
     "BE",  # Belgium
-    "BJ",  # Benin
-    "BO",  # Bolivia
-    "BR",  # Brazil
+    "BF",  # Burkina Faso
     "BG",  # Bulgaria
-    "KH",  # Cambodia
+    "BH",  # Bahrain
+    "BI",  # Burundi
+    "BJ",  # Benin
+    "BM",  # Bermuda
+    "BN",  # Brunei
+    "BO",  # Bolivia
+    "BQ",  # Bonaire, Sint Eustatius and Saba
+    "BR",  # Brazil
+    "BS",  # Bahamas
+    "BT",  # Bhutan
+    "BW",  # Botswana
+    "BY",  # Belarus
+    "BZ",  # Belize
     "CA",  # Canada
-    "KY",  # Cayman Islands
+    "CD",  # Democratic Republic of the Congo
+    "CF",  # Central African Republic
+    "CG",  # Republic Of The Congo
+    "CH",  # Switzerland
+    "CI",  # Ivory Coast
+    "CK",  # Cook Islands
     "CL",  # Chile
+    "CM",  # Cameroon
     "CN",  # China
     "CO",  # Colombia
     "CR",  # Costa Rica
-    "HR",  # Croatia
+    "CU",  # Cuba
+    "CV",  # Cape Verde
+    "CW",  # Curacao
     "CY",  # Cyprus
-    "CZ",  # Czech Republic
-    "DK",  # Denmark
-    "DO",  # Dominican Republic
-    "SV",  # El Salvador
-    "EE",  # Estonia
-    "FI",  # Finland
-    "FR",  # France
-    "GE",  # Georgia
+    "CZ",  # Czechia
     "DE",  # Germany
+    "DJ",  # Djibouti
+    "DK",  # Denmark
+    "DM",  # Dominica
+    "DO",  # Dominican Republic
+    "DZ",  # Algeria
+    "EC",  # Ecuador
+    "EE",  # Estonia
+    "EG",  # Egypt
+    "ER",  # Eritrea
+    "ES",  # Spain
+    "ET",  # Ethiopia
+    "FI",  # Finland
+    "FJ",  # Fiji
+    "FM",  # Micronesia
+    "FO",  # Faroe Islands
+    "FR",  # France
+    "GA",  # Gabon
+    "GB",  # United Kingdom
+    "GD",  # Grenada
+    "GE",  # Georgia
+    "GF",  # French Guiana
     "GH",  # Ghana
+    "GI",  # Gibraltar
+    "GL",  # Greenland
+    "GM",  # Gambia
+    "GN",  # Guinea
+    "GP",  # Guadeloupe
+    "GQ",  # Equatorial Guinea
     "GR",  # Greece
-    "GD",  # Grenanda
     "GT",  # Guatemala
-    "HN",  # Honduras
+    "GU",  # Guam
+    "GW",  # Guinea-Bissau
+    "GY",  # Guyana
     "HK",  # Hong Kong
+    "HN",  # Honduras
+    "HR",  # Croatia
+    "HT",  # Haiti
     "HU",  # Hungary
-    "IS",  # Iceland
-    "IN",  # India
     "ID",  # Indonesia
     "IE",  # Ireland
     "IL",  # Israel
+    "IN",  # India
+    "IQ",  # Iraq
+    "IR",  # Iran
+    "IS",  # Iceland
     "IT",  # Italy
     "JM",  # Jamaica
+    "JO",  # Jordan
     "JP",  # Japan
     "KE",  # Kenya
-    "LV",  # Latvia
+    "KG",  # Kyrgyzstan
+    "KH",  # Cambodia
+    "KI",  # Kiribati
+    "KM",  # Comoros
+    "KN",  # Saint Kitts and Nevis
+    "KR",  # South Korea
+    "KW",  # Kuwait
+    "KY",  # Cayman Islands
+    "KZ",  # Kazakhstan
+    "LA",  # Laos
+    "LB",  # Lebanon
+    "LC",  # Saint Lucia
     "LI",  # Liechtenstein
+    "LK",  # Sri Lanka
+    "LR",  # Liberia
+    "LS",  # Lesotho
     "LT",  # Lithuania
     "LU",  # Luxembourg
-    "MO",  # Macau
-    "MY",  # Malaysia
-    "MT",  # Malta
-    "MX",  # Mexico
+    "LV",  # Latvia
+    "LY",  # Libya
+    "MA",  # Morocco
+    "MC",  # Monaco
     "MD",  # Moldova
-    "NL",  # Netherlands
-    "NZ",  # New Zealand
+    "ME",  # Montenegro
+    "MG",  # Madagascar
+    "MH",  # Marshall Islands
+    "MK",  # Macedonia
+    "ML",  # Mali
+    "MM",  # Myanmar
+    "MN",  # Mongolia
+    "MO",  # Macau
+    "MP",  # Northern Mariana Islands
+    "MQ",  # Martinique
+    "MR",  # Mauritania
+    "MS",  # Montserrat
+    "MT",  # Malta
+    "MU",  # Mauritius
+    "MV",  # Maldives
+    "MW",  # Malawi
+    "MX",  # Mexico
+    "MY",  # Malaysia
+    "MZ",  # Mozambique
+    "NA",  # Namibia
+    "NC",  # New Caledonia
+    "NE",  # Niger
     "NG",  # Nigeria
+    "NI",  # Nicaragua
+    "NL",  # Netherlands
     "NO",  # Norway
-    "PK",  # Pakistan
+    "NP",  # Nepal
+    "NR",  # Nauru
+    "NZ",  # New Zealand
+    "OM",  # Oman
     "PA",  # Panama
     "PE",  # Peru
+    "PF",  # French Polynesia
+    "PG",  # Papua New Guinea
     "PH",  # Philippines
+    "PK",  # Pakistan
     "PL",  # Poland
-    "PT",  # Portugal
+    "PM",  # Saint Pierre and Miquelon
     "PR",  # Puerto Rico
+    "PS",  # Palestinian Territory
+    "PT",  # Portugal
+    "PW",  # Palau
+    "PY",  # Paraguay
+    "QA",  # Qatar
+    "RE",  # Réunion Island
     "RO",  # Romania
+    "RS",  # Serbia
     "RU",  # Russia
     "RW",  # Rwanda
     "SA",  # Saudi Arabia
-    "SG",  # Singapore
-    "SK",  # Slovakia
-    "SI",  # Slovenia
-    "ZA",  # South Africa
-    "KR",  # South Korea
-    "ES",  # Spain
+    "SB",  # Solomon Islands
+    "SC",  # Seychelles
+    "SD",  # Sudan
     "SE",  # Sweden
-    "CH",  # Switzerland
-    "TW",  # Taiwan
-    "TJ",  # Tajikistan
+    "SG",  # Singapore
+    "SI",  # Slovenia
+    "SK",  # Slovakia
+    "SL",  # Sierra Leone
+    "SM",  # San Marino
+    "SN",  # Senegal
+    "SO",  # Somalia
+    "SR",  # Suriname
+    "SS",  # South Sudan
+    "ST",  # Sao Tome and Principe
+    "SV",  # El Salvador
+    "SX",  # Sint Maarten (Dutch Part)
+    "SY",  # Syria
+    "SZ",  # Swaziland
+    "TC",  # Turks and Caicos Islands
+    "TD",  # Chad
+    "TG",  # Togo
     "TH",  # Thailand
-    "TT",  # Trinidad and Tobago
+    "TJ",  # Tajikistan
+    "TL",  # East Timor
+    "TM",  # Turkmenistan
+    "TN",  # Tunisia
+    "TO",  # Tonga
     "TR",  # Turkey
-    "GB",  # United Kingdom
+    "TT",  # Trinidad and Tobago
+    "TW",  # Taiwan
+    "TZ",  # Tanzania
+    "UA",  # Ukraine
+    "UG",  # Uganda
     "US",  # United States
     "UY",  # Uruguay
-    "VE",  # Venezuala
+    "UZ",  # Uzbekistan
+    "VC",  # Saint Vincent and The Grenadines
+    "VE",  # Venezuela
+    "VG",  # Virgin Islands, British
+    "VI",  # Virgin Islands, US
+    "VN",  # Vietnam
+    "VU",  # Vanuatu
+    "WS",  # Samoa
+    "XK",  # Kosovo
+    "YE",  # Yemen
+    "YT",  # Mayotte
+    "ZA",  # South Africa
     "ZM",  # Zambia
+    "ZW",  # Zimbabwe
 )
 
 NEXMO_SUPPORTED_COUNTRIES = tuple([(elt, COUNTRIES_NAMES[elt]) for elt in NEXMO_SUPPORTED_COUNTRIES_CONFIG])
@@ -487,7 +643,7 @@ def channel_status_processor(request):
     status = dict()
     user = request.user
 
-    if user.is_superuser or user.is_anonymous():
+    if user.is_superuser or user.is_anonymous:
         return status
 
     # from the logged in user get the channel
@@ -502,12 +658,10 @@ def channel_status_processor(request):
         cutoff = timezone.now() - timedelta(hours=1)
         send_channel = org.get_send_channel()
         call_channel = org.get_call_channel()
-        ussd_channel = org.get_ussd_channel()
 
         status["send_channel"] = send_channel
         status["call_channel"] = call_channel
-        status["has_outgoing_channel"] = send_channel or call_channel or ussd_channel
-        status["is_ussd_channel"] = True if ussd_channel else False
+        status["has_outgoing_channel"] = send_channel or call_channel
 
         channels = org.channels.filter(is_active=True)
         for channel in channels:
@@ -535,8 +689,9 @@ def get_commands(channel, commands, sync_event=None):
     """
     Generates sync commands for all queued messages on the given channel
     """
-    msgs = Msg.objects.filter(status__in=(PENDING, QUEUED, WIRED), channel=channel, direction=OUTGOING)
-    msgs = msgs.exclude(contact__is_test=True).exclude(topup=None)
+    msgs = Msg.objects.filter(status__in=(PENDING, QUEUED, WIRED), channel=channel, direction=OUTGOING).exclude(
+        topup=None
+    )
 
     if sync_event:
         pending_msgs = sync_event.get_pending_messages()
@@ -612,6 +767,8 @@ def sync(request, channel_id):
         if "cmds" in client_updates:
             cmds = client_updates["cmds"]
 
+            unique_calls = set()
+
             for cmd in cmds:
                 handled = False
                 extra = None
@@ -635,12 +792,11 @@ def sync(request, channel_id):
                         # it is possible to receive spam SMS messages from no number on some carriers
                         tel = cmd["phone"] if cmd["phone"] else "empty"
                         try:
-                            URN.normalize(URN.from_tel(tel), channel.country.code)
+                            urn = URN.normalize(URN.from_tel(tel), channel.country.code)
 
                             if "msg" in cmd:
-                                msg = Msg.create_incoming(channel, URN.from_tel(tel), cmd["msg"], sent_on=date)
-                                if msg:
-                                    extra = dict(msg_id=msg.id)
+                                msg = Msg.create_relayer_incoming(channel.org, channel, urn, cmd["msg"], date)
+                                extra = dict(msg_id=msg.id)
                         except ValueError:
                             pass
 
@@ -648,6 +804,7 @@ def sync(request, channel_id):
 
                     # phone event
                     elif keyword == "call":
+                        call_tuple = (cmd["ts"], cmd["type"], cmd["phone"])
                         date = datetime.fromtimestamp(int(cmd["ts"]) // 1000).replace(tzinfo=pytz.utc)
 
                         duration = 0
@@ -657,37 +814,28 @@ def sync(request, channel_id):
                         # Android sometimes will pass us a call from an 'unknown number', which is null
                         # ignore these events on our side as they have no purpose and break a lot of our
                         # assumptions
-                        if cmd["phone"]:
+                        if cmd["phone"] and call_tuple not in unique_calls:
                             urn = URN.from_parts(TEL_SCHEME, cmd["phone"])
                             try:
-                                ChannelEvent.create(channel, urn, cmd["type"], date, extra=dict(duration=duration))
+                                ChannelEvent.create_relayer_event(
+                                    channel, urn, cmd["type"], date, extra=dict(duration=duration)
+                                )
                             except ValueError:
                                 # in some cases Android passes us invalid URNs, in those cases just ignore them
                                 pass
+                            unique_calls.add(call_tuple)
                         handled = True
-
-                    elif keyword == "gcm":
-                        gcm_id = cmd.get("gcm_id", None)
-                        uuid = cmd.get("uuid", None)
-                        if channel.gcm_id != gcm_id or channel.uuid != uuid:
-                            channel.gcm_id = gcm_id
-                            channel.uuid = uuid
-                            channel.save(update_fields=["gcm_id", "uuid"])
-
-                        # no acking the gcm
-                        handled = False
 
                     elif keyword == "fcm":
                         # update our fcm and uuid
 
-                        channel.gcm_id = None
                         config = channel.config
                         config.update({Channel.CONFIG_FCM_ID: cmd["fcm_id"]})
                         channel.config = config
                         channel.uuid = cmd.get("uuid", None)
-                        channel.save(update_fields=["uuid", "config", "gcm_id"])
+                        channel.save(update_fields=["uuid", "config"])
 
-                        # no acking the gcm
+                        # no acking the fcm
                         handled = False
 
                     elif keyword == "reset":
@@ -744,9 +892,12 @@ def register(request):
     client_payload = json.loads(force_text(request.body))
     cmds = client_payload["cmds"]
 
-    # look up a channel with that id
-    channel = Channel.get_or_create_android(cmds[0], cmds[1])
-    cmd = channel.build_registration_command()
+    try:
+        # look up a channel with that id
+        channel = Channel.get_or_create_android(cmds[0], cmds[1])
+        cmd = channel.build_registration_command()
+    except UnsupportedAndroidChannelError:
+        cmd = dict(cmd="reg", relayer_claim_code="*********", relayer_secret="0" * 64, relayer_id=-1)
 
     return JsonResponse(dict(cmds=[cmd]))
 
@@ -1037,12 +1188,14 @@ class BaseClaimNumberMixin(ClaimViewMixin):
             form._errors["phone_number"] = form.error_class(
                 [
                     _(
-                        "That number is already connected to another account - %s (%s)"
-                        % (existing.org, existing.created_by.username)
+                        "That number is already connected to another account - %(org)s (%(user)s)"
+                        % dict(org=existing.org, user=existing.created_by.username)
                     )
                 ]
             )
             return self.form_invalid(form)
+
+        error_message = None
 
         # try to claim the number
         try:
@@ -1053,64 +1206,31 @@ class BaseClaimNumberMixin(ClaimViewMixin):
             self.remove_api_credentials_from_session()
 
             return HttpResponseRedirect("%s?success" % reverse("public.public_welcome"))
-        except Exception as e:  # pragma: needs cover
-            import traceback
 
-            traceback.print_exc()
+        except (
+            nexmo.AuthenticationError,
+            nexmo.ClientError,
+            twilio.base.exceptions.TwilioRestException,
+        ) as e:  # pragma: no cover
+            logger.warning(f"Unable to claim a number: {str(e)}", exc_info=True)
+            error_message = form.error_class([str(e)])
+
+        except Exception as e:  # pragma: needs cover
+            logger.error(f"Unable to claim a number: {str(e)}", exc_info=True)
+
             message = str(e)
             if message:
-                form._errors["phone_number"] = form.error_class([message])
+                error_message = form.error_class([message])
             else:
-                form._errors["phone_number"] = _(
+                error_message = _(
                     "An error occurred connecting your Twilio number, try removing your "
                     "Twilio account, reconnecting it and trying again."
                 )
-            return self.form_invalid(form)
 
+        if error_message is not None:
+            form._errors["phone_number"] = error_message
 
-class ClaimAndroidForm(forms.Form):
-    claim_code = forms.CharField(max_length=12, help_text=_("The claim code from your Android phone"))
-    phone_number = forms.CharField(max_length=15, help_text=_("The phone number of the phone"))
-
-    def __init__(self, *args, **kwargs):
-        self.org = kwargs.pop("org")
-        super().__init__(*args, **kwargs)
-
-    def clean_claim_code(self):
-        claim_code = self.cleaned_data["claim_code"]
-        claim_code = claim_code.replace(" ", "").upper()
-
-        # is there a channel with that claim?
-        channel = Channel.objects.filter(claim_code=claim_code, is_active=True).first()
-
-        if not channel:
-            raise forms.ValidationError(_("Invalid claim code, please check and try again."))
-        else:
-            self.cleaned_data["channel"] = channel
-
-        return claim_code
-
-    def clean_phone_number(self):
-        number = self.cleaned_data["phone_number"]
-
-        if "channel" in self.cleaned_data:
-            channel = self.cleaned_data["channel"]
-
-            # ensure number is valid for the channel's country
-            try:
-                normalized = phonenumbers.parse(number, channel.country.code)
-                if not phonenumbers.is_possible_number(normalized):
-                    raise forms.ValidationError(_("Invalid phone number, try again."))
-            except Exception:  # pragma: no cover
-                raise forms.ValidationError(_("Invalid phone number, try again."))
-
-            number = phonenumbers.format_number(normalized, phonenumbers.PhoneNumberFormat.E164)
-
-            # ensure no other active channel has this number
-            if self.org.channels.filter(address=number, is_active=True).exclude(pk=channel.pk).exists():
-                raise forms.ValidationError(_("Another channel has this number. Please remove that channel first."))
-
-        return number
+        return self.form_invalid(form)
 
 
 class UpdateChannelForm(forms.ModelForm):
@@ -1119,40 +1239,33 @@ class UpdateChannelForm(forms.ModelForm):
         del kwargs["object"]
 
         super().__init__(*args, **kwargs)
-        self.add_config_fields()
 
-    def add_config_fields(self):
-        pass
+        self.config_fields = []
+
+        if TEL_SCHEME in self.object.schemes:
+            self.add_config_field(
+                Channel.CONFIG_ALLOW_INTERNATIONAL,
+                forms.BooleanField(required=False, help_text=_("Allow international sending")),
+                False,
+            )
+
+    def add_config_field(self, config_key, field, default):
+        field.initial = self.instance.config.get(config_key, default)
+
+        self.fields[config_key] = field
+        self.config_fields.append(config_key)
 
     class Meta:
         model = Channel
         fields = "name", "address", "country", "alert_email"
-        config_fields = []
         readonly = ("address", "country")
         labels = {"address": _("Address")}
         helps = {"address": _("The number or address of this channel")}
 
 
-class UpdateNexmoForm(UpdateChannelForm):
+class UpdateTelChannelForm(UpdateChannelForm):
     class Meta(UpdateChannelForm.Meta):
-        readonly = ("country",)
-
-
-class UpdateAndroidForm(UpdateChannelForm):
-    class Meta(UpdateChannelForm.Meta):
-        readonly = []
-        helps = {"address": _("Phone number of this device")}
-
-
-class UpdateTwitterForm(UpdateChannelForm):
-    class Meta(UpdateChannelForm.Meta):
-        fields = "name", "address", "alert_email"
-        readonly = ("address",)
-        labels = {"address": _("Handle")}
-        helps = {"address": _("Twitter handle of this channel")}
-
-
-TYPE_UPDATE_FORM_CLASSES = {Channel.TYPE_ANDROID: UpdateAndroidForm}
+        helps = {"address": _("Phone number of this channel")}
 
 
 class ChannelCRUDL(SmartCRUDL):
@@ -1164,7 +1277,6 @@ class ChannelCRUDL(SmartCRUDL):
         "read",
         "delete",
         "search_numbers",
-        "claim_android",
         "configuration",
         "search_nexmo",
         "bulk_sender_options",
@@ -1177,7 +1289,7 @@ class ChannelCRUDL(SmartCRUDL):
 
     class Read(OrgObjPermsMixin, SmartReadView):
         slug_url_kwarg = "uuid"
-        exclude = ("id", "is_active", "created_by", "modified_by", "modified_on", "gcm_id")
+        exclude = ("id", "is_active", "created_by", "modified_by", "modified_on")
 
         def get_queryset(self):
             return Channel.objects.filter(is_active=True)
@@ -1199,7 +1311,7 @@ class ChannelCRUDL(SmartCRUDL):
                     links.append(
                         dict(title=_("Disable Bulk Sending"), style="btn-primary", href="#", js_class="remove-sender")
                     )
-                elif self.get_object().channel_type == Channel.TYPE_ANDROID:
+                elif self.get_object().is_android():
                     links.append(
                         dict(
                             title=_("Enable Bulk Sending"),
@@ -1220,6 +1332,16 @@ class ChannelCRUDL(SmartCRUDL):
 
             if self.object.channel_type == "FB" and self.has_org_perm("channels.channel_facebook_whitelist"):
                 links.append(dict(title=_("Whitelist Domain"), js_class="facebook-whitelist", href="#"))
+
+            user = self.get_user()
+            if user.is_superuser or user.is_staff:
+                links.append(
+                    dict(
+                        title=_("Service"),
+                        posterize=True,
+                        href=f'{reverse("orgs.org_service")}?organization={self.object.org_id}&redirect_url={reverse("channels.channel_read", args=[self.get_object().uuid])}',
+                    )
+                )
 
             return links
 
@@ -1428,17 +1550,17 @@ class ChannelCRUDL(SmartCRUDL):
         form_class = DomainForm
 
         def get_queryset(self):
-            return Channel.objects.filter(is_active=True, org=self.request.user.get_org())
+            return Channel.objects.filter(is_active=True, org=self.request.user.get_org(), channel_type="FB")
 
         def execute_action(self):
             # curl -X POST -H "Content-Type: application/json" -d '{
             #  "setting_type" : "domain_whitelisting",
             #  "whitelisted_domains" : ["https://petersfancyapparel.com"],
             #  "domain_action_type": "add"
-            # }' "https://graph.facebook.com/v2.12/me/thread_settings?access_token=PAGE_ACCESS_TOKEN"
+            # }' "https://graph.facebook.com/v3.3/me/thread_settings?access_token=PAGE_ACCESS_TOKEN"
             access_token = self.object.config[Channel.CONFIG_AUTH_TOKEN]
             response = requests.post(
-                "https://graph.facebook.com/v2.12/me/thread_settings?access_token=" + access_token,
+                "https://graph.facebook.com/v3.3/me/thread_settings?access_token=" + access_token,
                 json=dict(
                     setting_type="domain_whitelisting",
                     whitelisted_domains=[self.form.cleaned_data["whitelisted_domain"]],
@@ -1488,10 +1610,15 @@ class ChannelCRUDL(SmartCRUDL):
                 )
                 return HttpResponseRedirect(reverse("orgs.org_home"))
 
-            except Exception as e:  # pragma: no cover
-                import traceback
+            except ValueError as e:
+                logger.error("Error removing a channel", exc_info=True)
 
-                traceback.print_exc()
+                messages.error(request, str(e))
+                return HttpResponseRedirect(reverse("channels.channel_read", args=[channel.uuid]))
+
+            except Exception:  # pragma: no cover
+                logger.error("Error removing a channel", exc_info=True)
+
                 messages.error(request, _("We encountered an error removing your channel, please try again later."))
                 return HttpResponseRedirect(reverse("channels.channel_read", args=[channel.uuid]))
 
@@ -1527,9 +1654,8 @@ class ChannelCRUDL(SmartCRUDL):
             return kwargs
 
         def pre_save(self, obj):
-            if obj.config:
-                for field in self.form.Meta.config_fields:  # pragma: needs cover
-                    obj.config[field] = bool(self.form.cleaned_data[field])
+            for field in self.form.config_fields:
+                obj.config[field] = self.form.cleaned_data[field]
             return obj
 
         def post_save(self, obj):
@@ -1618,7 +1744,7 @@ class ChannelCRUDL(SmartCRUDL):
             user = self.request.user
 
             channel = form.cleaned_data["channel"]
-            Channel.add_send_channel(user, channel)
+            Channel.add_nexmo_bulk_sender(user, channel)
             return super().form_valid(form)
 
         def form_invalid(self, form):
@@ -1647,7 +1773,9 @@ class ChannelCRUDL(SmartCRUDL):
                 channel = self.cleaned_data["channel"]
                 channel = self.org.channels.filter(pk=channel).first()
                 if not channel:
-                    raise forms.ValidationError(_("Sorry, a caller cannot be added for that number"))
+                    raise forms.ValidationError(_("A caller cannot be added for that number"))
+                if channel.get_caller():
+                    raise forms.ValidationError(_("A caller has already been added for that number"))
                 return channel
 
         form_class = CallerForm
@@ -1672,7 +1800,7 @@ class ChannelCRUDL(SmartCRUDL):
         def get_success_url(self):
             return reverse("orgs.org_home")
 
-    class Configuration(OrgPermsMixin, SmartReadView):
+    class Configuration(OrgObjPermsMixin, SmartReadView):
         slug_url_kwarg = "uuid"
 
         def get_context_data(self, **kwargs):
@@ -1688,60 +1816,6 @@ class ChannelCRUDL(SmartCRUDL):
             context["show_public_addresses"] = channel_type.show_public_addresses
 
             return context
-
-    class ClaimAndroid(OrgPermsMixin, SmartFormView):
-        fields = ("claim_code", "phone_number")
-        form_class = ClaimAndroidForm
-        title = _("Connect Android Channel")
-        permission = "channels.channel_claim"
-
-        def get_form_kwargs(self):
-            kwargs = super().get_form_kwargs()
-            kwargs["org"] = self.request.user.get_org()
-            return kwargs
-
-        def get_success_url(self):
-            return "%s?success" % reverse("public.public_welcome")
-
-        def form_valid(self, form):
-            org = self.request.user.get_org()
-
-            if not org:  # pragma: no cover
-                raise Exception(_("No org for this user, cannot claim"))
-
-            self.object = Channel.objects.filter(claim_code=self.form.cleaned_data["claim_code"]).first()
-
-            country = self.object.country
-            phone_country = ContactURN.derive_country_from_tel(
-                self.form.cleaned_data["phone_number"], str(self.object.country)
-            )
-
-            # always prefer the country of the phone number they are entering if we have one
-            if phone_country and phone_country != country:  # pragma: needs cover
-                self.object.country = phone_country
-
-            analytics.track(self.request.user.username, "temba.channel_create")
-
-            self.object.claim(org, self.request.user, self.form.cleaned_data["phone_number"])
-            self.object.save()
-
-            # trigger a sync
-            self.object.trigger_sync()
-
-            return super().form_valid(form)
-
-        def derive_org(self):
-            user = self.request.user
-            org = None
-
-            if not user.is_anonymous():
-                org = user.get_org()
-
-            org_id = self.request.session.get("org_id", None)
-            if org_id:  # pragma: needs cover
-                org = Org.objects.get(pk=org_id)
-
-            return org
 
     class List(OrgPermsMixin, SmartListView):
         title = _("Channels")
@@ -1798,16 +1872,22 @@ class ChannelCRUDL(SmartCRUDL):
         def search_available_numbers(self, client, **kwargs):
             available_numbers = []
 
-            kwargs["type"] = "local"
+            country = kwargs["country"]
+            del kwargs["country"]
+
             try:
-                available_numbers += client.phone_numbers.search(**kwargs)
-            except TwilioRestException:  # pragma: no cover
+                available_numbers += client.api.available_phone_numbers(country).local.list(**kwargs)
+            except TwilioException:  # pragma: no cover
                 pass
 
-            kwargs["type"] = "mobile"
             try:
-                available_numbers += client.phone_numbers.search(**kwargs)
-            except TwilioRestException:  # pragma: no cover
+                available_numbers += client.api.available_phone_numbers(country).mobile.list(**kwargs)
+            except TwilioException:  # pragma: no cover
+                pass
+
+            try:
+                available_numbers += client.api.available_phone_numbers(country).toll_free.list(**kwargs)
+            except TwilioException:  # pragma: no cover
                 pass
 
             return available_numbers
@@ -1878,7 +1958,8 @@ class ChannelCRUDL(SmartCRUDL):
 
                 return JsonResponse(numbers, safe=False)
             except Exception as e:
-                return JsonResponse(dict(error=str(e)))
+                raise e
+                # return JsonResponse(dict(error=str(e)))
 
     class SearchPlivo(SearchNumbers):
         class SearchPlivoForm(forms.Form):
@@ -1962,30 +2043,37 @@ class ChannelEventCRUDL(SmartCRUDL):
 
 class ChannelLogCRUDL(SmartCRUDL):
     model = ChannelLog
-    actions = ("list", "read", "session")
+    actions = ("list", "read", "connection")
 
     class List(OrgPermsMixin, SmartListView):
         fields = ("channel", "description", "created_on")
         link_fields = ("channel", "description", "created_on")
         paginate_by = 50
 
+        @classmethod
+        def derive_url_pattern(cls, path, action):
+            return r"^%s/(?P<channel_uuid>[^/]+)/$" % path
+
+        def derive_channel(self):
+            return get_object_or_404(Channel, uuid=self.kwargs["channel_uuid"])
+
         def derive_org(self):
-            channel = Channel.objects.get(pk=self.request.GET["channel"])
+            channel = self.derive_channel()
             return channel.org
 
         def derive_queryset(self, **kwargs):
-            channel = Channel.objects.get(pk=self.request.GET["channel"])
+            channel = self.derive_channel()
 
-            if self.request.GET.get("sessions"):
+            if self.request.GET.get("connections"):
                 logs = (
                     ChannelLog.objects.filter(channel=channel)
                     .exclude(connection=None)
                     .values_list("connection_id", flat=True)
                 )
-                events = ChannelSession.objects.filter(id__in=logs).order_by("-created_on")
+                events = ChannelConnection.objects.filter(id__in=logs).order_by("-created_on")
 
                 if self.request.GET.get("errors"):
-                    events = events.filter(status=ChannelSession.FAILED)
+                    events = events.filter(status=ChannelConnection.FAILED)
 
             elif self.request.GET.get("others"):
                 events = ChannelLog.objects.filter(channel=channel, connection=None, msg=None).order_by("-created_on")
@@ -1995,26 +2083,25 @@ class ChannelLogCRUDL(SmartCRUDL):
                     ChannelLog.objects.filter(channel=channel, connection=None)
                     .exclude(msg=None)
                     .order_by("-created_on")
-                    .select_related("msg__contact", "msg")
+                    .select_related("msg", "msg__contact", "msg__contact_urn", "channel", "channel__org")
                 )
-                events.count = lambda: channel.get_non_ivr_log_count()
+                patch_queryset_count(events, channel.get_non_ivr_log_count)
 
             return events
 
         def get_context_data(self, **kwargs):
             context = super().get_context_data(**kwargs)
-            context["channel"] = Channel.objects.get(pk=self.request.GET["channel"])
+            context["channel"] = self.derive_channel()
             return context
 
-    class Session(AnonMixin, OrgPermsMixin, SmartReadView):
-        model = ChannelSession
+    class Connection(AnonMixin, SmartReadView):
+        model = ChannelConnection
 
-    class Read(AnonMixin, OrgPermsMixin, SmartReadView):
+    class Read(OrgObjPermsMixin, SmartReadView):
         fields = ("description", "created_on")
 
-        def derive_org(self):
-            object = self.get_object()
-            return object.channel.org if object else None
+        def get_object_org(self):
+            return self.get_object().channel.org
 
         def derive_queryset(self, **kwargs):
             queryset = super().derive_queryset(**kwargs)

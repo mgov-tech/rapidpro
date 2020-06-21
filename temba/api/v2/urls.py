@@ -1,4 +1,3 @@
-
 from rest_framework.urlpatterns import format_suffix_patterns
 
 from django.conf.urls import url
@@ -12,6 +11,7 @@ from .views import (
     CampaignsEndpoint,
     ChannelEventsEndpoint,
     ChannelsEndpoint,
+    ClassifiersEndpoint,
     ContactActionsEndpoint,
     ContactsEndpoint,
     DefinitionsEndpoint,
@@ -19,6 +19,7 @@ from .views import (
     FieldsEndpoint,
     FlowsEndpoint,
     FlowStartsEndpoint,
+    GlobalsEndpoint,
     GroupsEndpoint,
     LabelsEndpoint,
     MediaEndpoint,
@@ -30,6 +31,8 @@ from .views import (
     ResthookSubscribersEndpoint,
     RootView,
     RunsEndpoint,
+    TemplatesEndpoint,
+    TicketersEndpoint,
 )
 
 urlpatterns = [
@@ -44,12 +47,14 @@ urlpatterns = [
     url(r"^campaign_events$", CampaignEventsEndpoint.as_view(), name="api.v2.campaign_events"),
     url(r"^channels$", ChannelsEndpoint.as_view(), name="api.v2.channels"),
     url(r"^channel_events$", ChannelEventsEndpoint.as_view(), name="api.v2.channel_events"),
+    url(r"^classifiers$", ClassifiersEndpoint.as_view(), name="api.v2.classifiers"),
     url(r"^contacts$", ContactsEndpoint.as_view(), name="api.v2.contacts"),
     url(r"^contact_actions$", ContactActionsEndpoint.as_view(), name="api.v2.contact_actions"),
     url(r"^definitions$", DefinitionsEndpoint.as_view(), name="api.v2.definitions"),
     url(r"^fields$", FieldsEndpoint.as_view(), name="api.v2.fields"),
     url(r"^flow_starts$", FlowStartsEndpoint.as_view(), name="api.v2.flow_starts"),
     url(r"^flows$", FlowsEndpoint.as_view(), name="api.v2.flows"),
+    url(r"^globals$", GlobalsEndpoint.as_view(), name="api.v2.globals"),
     url(r"^groups$", GroupsEndpoint.as_view(), name="api.v2.groups"),
     url(r"^labels$", LabelsEndpoint.as_view(), name="api.v2.labels"),
     url(r"^media$", MediaEndpoint.as_view(), name="api.v2.media"),
@@ -60,6 +65,8 @@ urlpatterns = [
     url(r"^resthook_events$", ResthookEventsEndpoint.as_view(), name="api.v2.resthook_events"),
     url(r"^resthook_subscribers$", ResthookSubscribersEndpoint.as_view(), name="api.v2.resthook_subscribers"),
     url(r"^runs$", RunsEndpoint.as_view(), name="api.v2.runs"),
+    url(r"^templates$", TemplatesEndpoint.as_view(), name="api.v2.templates"),
+    url(r"^ticketers$", TicketersEndpoint.as_view(), name="api.v2.ticketers"),
 ]
 
 urlpatterns = format_suffix_patterns(urlpatterns, allowed=["json", "api"])

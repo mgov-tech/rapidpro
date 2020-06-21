@@ -1,4 +1,3 @@
-
 from django.utils.translation import ugettext_lazy as _
 
 from temba.channels.types.jasmin.views import ClaimView
@@ -20,7 +19,7 @@ class JasminType(ChannelType):
     name = "Jasmin"
 
     claim_blurb = _(
-        """Connect your <a href="http://www.jasminsms.com/" target="_blank">Jasmin</a> instance that you have
+        """Connect your <a href="http://www.jasminsms.com/">Jasmin</a> instance that you have
                        already connected to an SMSC."""
     )
     claim_view = ClaimView

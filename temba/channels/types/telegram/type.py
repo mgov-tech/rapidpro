@@ -1,4 +1,3 @@
-
 import telegram
 
 from django.urls import reverse
@@ -35,6 +34,8 @@ class TelegramType(ChannelType):
     max_length = 1600
     attachment_support = True
     free_sending = True
+
+    redact_response_keys = {"first_name", "last_name", "username"}
 
     def activate(self, channel):
         config = channel.config

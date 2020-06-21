@@ -1,47 +1,91 @@
-import json
 import time
+import types
 from collections import OrderedDict
-from uuid import uuid4
 
 from smartmin.models import SmartModel
 
-from django.contrib.postgres.fields import HStoreField
+from django.contrib.postgres.fields import HStoreField, JSONField as DjangoJSONField
 from django.core import checks
 from django.core.exceptions import ValidationError
 from django.db import connection, models
 from django.utils.functional import cached_property
 from django.utils.translation import ugettext_lazy as _
 
+from temba.utils import json, uuid
+
 
 def generate_uuid():
-    return str(uuid4())
-
-
-class ProxyQuerySet(object):
     """
-    Helper class that mimics the behavior of a Django QuerySet
+    Returns a random stringified UUID for use with older models that use char fields instead of UUID fields
+    """
+    return str(uuid.uuid4())
 
-    The result is cached so we can't chain it as a normal QuerySet, but becuse we defined special methods that are
-    expected by templates and tests we can use it as an evaluated QuerySet
+
+def patch_queryset_count(qs, function):
+    """
+    As of Django 2.2 a patched .count on querysets has to look like a real method
+    """
+    qs.count = types.MethodType(lambda s: function(), qs)
+
+
+class IDSliceQuerySet(models.query.RawQuerySet):
+    """
+    QuerySet defined by a model, set of ids, offset and total count
     """
 
-    def __init__(self, object_list):
-        self.object_list = object_list
+    def __init__(self, model, ids, offset, total):
+        if len(ids) > 0:
+            # build a list of sequence to model id, so we can sort by the sequence in our results
+            pairs = ",".join(str((seq, model_id)) for seq, model_id in enumerate(ids, start=1))
+
+            super().__init__(
+                f"""
+                SELECT
+                  model.*
+                FROM
+                  {model._meta.db_table} AS model
+                JOIN (VALUES {pairs}) tmp_resultset (seq, model_id)
+                ON model.id = tmp_resultset.model_id
+                ORDER BY tmp_resultset.seq
+                """,
+                model,
+            )
+        else:
+            super().__init__(f"""SELECT * FROM {model._meta.db_table} WHERE id < 0""", model)
+
+        self.ids = ids
+        self.total = total
+        self.offset = offset
+
+    def __getitem__(self, k):
+        """
+        Called to slice our queryset. ID Slice Query Sets care created pre-sliced, that is the offset and counts should
+        match the way any kind of paginator is going to try to slice the queryset.
+        """
+        if isinstance(k, int):
+            # single item
+            if k < self.offset or k >= self.offset + len(self.ids):
+                raise IndexError("attempt to access element outside slice")
+
+            return super().__getitem__(k - self.offset)
+
+        elif isinstance(k, slice):
+            start = k.start if k.start else 0
+            if start != self.offset:
+                raise IndexError(
+                    f"attempt to slice ID queryset with differing offset: [{k.start}:{k.stop}] != [{self.offset}:{self.offset+len(self.ids)}]"
+                )
+
+            return list(self)[: k.stop - self.offset]
+
+        else:
+            raise TypeError(f"__getitem__ index must be int, not {type(k)}")
 
     def count(self):
-        return len(self)
-
-    def __iter__(self):
-        return iter(self.object_list)
-
-    def __len__(self):
-        return len(self.object_list)
-
-    def __getitem__(self, item):
-        return self.object_list[item]
+        return self.total
 
 
-def mapEStoDB(model, es_queryset, only_ids=False):
+def mapEStoDB(model, es_queryset, only_ids=False):  # pragma: no cover
     """
     Map ElasticSearch results to Django Model objects
     We use object PKs from ElasticSearch result set and select those objects in the database
@@ -62,7 +106,7 @@ def mapEStoDB(model, es_queryset, only_ids=False):
                 ORDER BY tmp_resultset.seq
                 """
             )
-        else:
+        else:  # pragma: no cover
             return model.objects.none()
 
 
@@ -131,18 +175,13 @@ class JSONAsTextField(CheckFieldDefaultMixin, models.Field):
         * uses standard JSON serializers so it expects that all data is a valid JSON data
         * be careful with default values, it must be a callable returning a dict because using `default={}` will create
           a mutable default that is share between all instances of the JSONAsTextField
-          * https://docs.djangoproject.com/en/1.11/ref/contrib/postgres/fields/#jsonfield
-        * arg `object_pairs_hook` depends on the json serializer implementation
-          * Python 3.7 will guarantees to preserve dict insert order
-            * https://mail.python.org/pipermail/python-dev/2017-December/151283.html
+          https://docs.djangoproject.com/en/1.11/ref/contrib/postgres/fields/#jsonfield
     """
 
     description = "Custom JSON field that is stored as Text in the database"
     _default_hint = ("dict", "{}")
 
-    def __init__(self, object_pairs_hook=dict, *args, **kwargs):
-
-        self.object_pairs_hook = object_pairs_hook
+    def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
     def from_db_value(self, value, *args, **kwargs):
@@ -153,7 +192,7 @@ class JSONAsTextField(CheckFieldDefaultMixin, models.Field):
             return value
 
         if isinstance(value, str):
-            data = json.loads(value, object_pairs_hook=self.object_pairs_hook)
+            data = json.loads(value)
 
             if type(data) not in (list, dict, OrderedDict):
                 raise ValueError("JSONAsTextField should be a dict or a list, got %s => %s" % (type(data), data))
@@ -185,10 +224,17 @@ class JSONAsTextField(CheckFieldDefaultMixin, models.Field):
 
     def deconstruct(self):
         name, path, args, kwargs = super().deconstruct()
-        # Only include kwarg if it's not the default
-        if self.object_pairs_hook != dict:
-            kwargs["object_pairs_hook"] = self.object_pairs_hook
         return name, path, args, kwargs
+
+
+class JSONField(DjangoJSONField):
+    """
+    Convenience subclass of the regular JSONField that uses our custom JSON encoder
+    """
+
+    def __init__(self, *args, **kwargs):
+        kwargs["encoder"] = json.TembaEncoder
+        super().__init__(*args, **kwargs)
 
 
 class TembaModel(SmartModel):
@@ -211,7 +257,7 @@ class RequireUpdateFieldsMixin(object):
         if self.id and "update_fields" not in kwargs:
             raise ValueError("Updating without specifying update_fields is disabled for this model")
 
-        return super().save(*args, **kwargs)
+        super().save(*args, **kwargs)
 
 
 class SquashableModel(models.Model):
@@ -233,6 +279,7 @@ class SquashableModel(models.Model):
     def squash(cls):
         start = time.time()
         num_sets = 0
+
         for distinct_set in cls.get_unsquashed().order_by(*cls.SQUASH_OVER).distinct(*cls.SQUASH_OVER)[:5000]:
             with connection.cursor() as cursor:
                 sql, params = cls.get_squash_query(distinct_set)

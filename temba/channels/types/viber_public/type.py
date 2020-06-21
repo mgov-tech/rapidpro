@@ -1,4 +1,3 @@
-
 import requests
 
 from django.urls import reverse
@@ -7,7 +6,7 @@ from django.utils.translation import ugettext_lazy as _
 from temba.contacts.models import VIBER_SCHEME
 
 from ...models import ChannelType
-from .views import ClaimView
+from .views import ClaimView, UpdateForm
 
 
 class ViberPublicType(ChannelType):
@@ -25,11 +24,13 @@ class ViberPublicType(ChannelType):
 
     schemes = [VIBER_SCHEME]
     max_length = 7000
-    attachment_support = False
+    attachment_support = True
     free_sending = True
     quick_reply_text_size = 36
 
     claim_view = ClaimView
+
+    update_form = UpdateForm
 
     claim_blurb = _(
         """

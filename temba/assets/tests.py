@@ -1,9 +1,12 @@
-from django.core.urlresolvers import reverse
+from django.test import override_settings
+from django.urls import reverse
 
 from temba.contacts.models import ExportContactsTask
 from temba.flows.models import ExportFlowResultsTask
 from temba.msgs.models import ExportMessagesTask, SystemLabel
 from temba.tests import TembaTest
+
+from .checks import storage_url
 
 
 class AssetTest(TembaTest):
@@ -70,10 +73,9 @@ class AssetTest(TembaTest):
         self.assertContains(response, "Your download should start automatically", status_code=200)
 
         # add our admin to another org
-        self.create_secondary_org()
         self.org2.administrators.add(self.admin)
-
         self.admin.set_org(self.org2)
+
         s = self.client.session
         s["org_id"] = self.org2.pk
         s.save()
@@ -116,3 +118,14 @@ class AssetTest(TembaTest):
             reverse("assets.stream", kwargs=dict(type="message_export", pk=message_export_task.pk))
         )
         self.assertEqual(response.status_code, 200)
+
+
+class SystemChecksTest(TembaTest):
+    def test_storage_url(self):
+        self.assertEqual(len(storage_url(None)), 0)
+
+        with override_settings(STORAGE_URL=None):
+            self.assertEqual(storage_url(None)[0].msg, "No storage URL set")
+
+        with override_settings(STORAGE_URL="http://example.com/uploads/"):
+            self.assertEqual(storage_url(None)[0].msg, "Storage URL shouldn't end with trailing slash")

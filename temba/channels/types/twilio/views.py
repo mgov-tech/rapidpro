@@ -1,10 +1,7 @@
-
-from uuid import uuid4
-
 import phonenumbers
 from phonenumbers.phonenumberutil import region_code_for_number
 from smartmin.views import SmartFormView
-from twilio import TwilioRestException
+from twilio.base.exceptions import TwilioRestException
 
 from django import forms
 from django.conf import settings
@@ -12,9 +9,9 @@ from django.http import HttpResponseRedirect
 from django.urls import reverse
 from django.utils.translation import ugettext_lazy as _
 
-from temba.orgs.models import ACCOUNT_SID, ACCOUNT_TOKEN
-from temba.utils import analytics
+from temba.orgs.models import Org
 from temba.utils.timezones import timezone_to_country_code
+from temba.utils.uuid import uuid4
 
 from ...models import Channel
 from ...views import (
@@ -54,7 +51,7 @@ class ClaimView(BaseClaimNumberMixin, SmartFormView):
             self.client = org.get_twilio_client()
             if not self.client:
                 return HttpResponseRedirect(reverse("orgs.org_twilio_connect"))
-            self.account = self.client.accounts.get(org.config[ACCOUNT_SID])
+            self.account = self.client.api.account.fetch()
         except TwilioRestException:
             return HttpResponseRedirect(reverse("orgs.org_twilio_connect"))
 
@@ -78,8 +75,8 @@ class ClaimView(BaseClaimNumberMixin, SmartFormView):
     def get_existing_numbers(self, org):
         client = org.get_twilio_client()
         if client:
-            twilio_account_numbers = client.phone_numbers.list(page_size=1000)
-            twilio_short_codes = client.sms.short_codes.list(page_size=1000)
+            twilio_account_numbers = client.api.incoming_phone_numbers.stream(page_size=1000)
+            twilio_short_codes = client.api.short_codes.stream(page_size=1000)
 
         numbers = []
         for number in twilio_account_numbers:
@@ -107,37 +104,37 @@ class ClaimView(BaseClaimNumberMixin, SmartFormView):
         org = user.get_org()
 
         client = org.get_twilio_client()
-        twilio_phones = client.phone_numbers.list(phone_number=phone_number)
+        twilio_phones = client.api.incoming_phone_numbers.stream(phone_number=phone_number)
         channel_uuid = uuid4()
 
         # create new TwiML app
         callback_domain = org.get_brand_domain()
-        new_receive_url = "https://" + callback_domain + reverse("courier.t", args=[channel_uuid, "receive"])
-        new_status_url = (
-            "https://" + callback_domain + reverse("handlers.twilio_handler", args=["status", channel_uuid])
-        )
-        new_voice_url = "https://" + callback_domain + reverse("handlers.twilio_handler", args=["voice", channel_uuid])
+        base_url = "https://" + callback_domain
+        receive_url = base_url + reverse("courier.t", args=[channel_uuid, "receive"])
+        status_url = base_url + reverse("mailroom.ivr_handler", args=[channel_uuid, "status"])
+        voice_url = base_url + reverse("mailroom.ivr_handler", args=[channel_uuid, "incoming"])
 
-        new_app = client.applications.create(
+        new_app = client.api.applications.create(
             friendly_name="%s/%s" % (callback_domain.lower(), channel_uuid),
-            sms_url=new_receive_url,
             sms_method="POST",
-            voice_url=new_voice_url,
-            voice_fallback_url="https://" + settings.AWS_BUCKET_DOMAIN + "/voice_unavailable.xml",
-            voice_fallback_method="GET",
-            status_callback=new_status_url,
+            sms_url=receive_url,
+            voice_method="POST",
+            voice_url=voice_url,
             status_callback_method="POST",
+            status_callback=status_url,
+            voice_fallback_method="GET",
+            voice_fallback_url=f"{settings.STORAGE_URL}/voice_unavailable.xml",
         )
 
         is_short_code = len(phone_number) <= 6
         if is_short_code:
-            short_codes = client.sms.short_codes.list(short_code=phone_number)
+            short_codes = client.api.short_codes.stream(short_code=phone_number)
+            short_code = next(short_codes, None)
 
-            if short_codes:
-                short_code = short_codes[0]
+            if short_code:
                 number_sid = short_code.sid
                 app_url = "https://" + callback_domain + "%s" % reverse("courier.t", args=[channel_uuid, "receive"])
-                client.sms.short_codes.update(number_sid, sms_url=app_url, sms_method="POST")
+                client.api.short_codes.get(number_sid).update(sms_url=app_url, sms_method="POST")
 
                 role = Channel.ROLE_SEND + Channel.ROLE_RECEIVE
                 phone = phone_number
@@ -150,14 +147,15 @@ class ClaimView(BaseClaimNumberMixin, SmartFormView):
                     )
                 )
         else:
-            if twilio_phones:
-                twilio_phone = twilio_phones[0]
-                client.phone_numbers.update(
-                    twilio_phone.sid, voice_application_sid=new_app.sid, sms_application_sid=new_app.sid
+            twilio_phone = next(twilio_phones, None)
+            if twilio_phone:
+
+                client.api.incoming_phone_numbers.get(twilio_phone.sid).update(
+                    voice_application_sid=new_app.sid, sms_application_sid=new_app.sid
                 )
 
             else:  # pragma: needs cover
-                twilio_phone = client.phone_numbers.purchase(
+                twilio_phone = client.api.incoming_phone_numbers.create(
                     phone_number=phone_number, voice_application_sid=new_app.sid, sms_application_sid=new_app.sid
                 )
 
@@ -171,15 +169,13 @@ class ClaimView(BaseClaimNumberMixin, SmartFormView):
         config = {
             Channel.CONFIG_APPLICATION_SID: new_app.sid,
             Channel.CONFIG_NUMBER_SID: number_sid,
-            Channel.CONFIG_ACCOUNT_SID: org_config[ACCOUNT_SID],
-            Channel.CONFIG_AUTH_TOKEN: org_config[ACCOUNT_TOKEN],
+            Channel.CONFIG_ACCOUNT_SID: org_config[Org.CONFIG_TWILIO_SID],
+            Channel.CONFIG_AUTH_TOKEN: org_config[Org.CONFIG_TWILIO_TOKEN],
             Channel.CONFIG_CALLBACK_DOMAIN: callback_domain,
         }
 
         channel = Channel.create(
             org, user, country, "T", name=phone, address=phone_number, role=role, config=config, uuid=channel_uuid
         )
-
-        analytics.track(user.username, "temba.channel_claim_twilio", properties=dict(number=phone_number))
 
         return channel

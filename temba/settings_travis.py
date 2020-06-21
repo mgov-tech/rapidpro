@@ -1,10 +1,9 @@
-
 from .settings import *  # noqa
 
 # -----------------------------------------------------------------------------------
-# Flowserver - on Travis we start a GoFlow instance at http://localhost:8800
+# Mailroom - on Travis we start an instance at http://localhost:8090
 # -----------------------------------------------------------------------------------
-FLOW_SERVER_URL = "http://localhost:8800"
+MAILROOM_URL = "http://localhost:8090"
 
 DATABASES = {
     "default": {
@@ -17,8 +16,11 @@ DATABASES = {
         "ATOMIC_REQUESTS": True,
         "CONN_MAX_AGE": 60,
         "OPTIONS": {},
+        "TEST": {"NAME": "temba"},  # use this same database for unit tests
     }
 }
+
+DATABASES["direct"] = DATABASES["default"]
 
 # Use a fast hasher to speed up tests.
 PASSWORD_HASHERS = ["django.contrib.auth.hashers.MD5PasswordHasher"]

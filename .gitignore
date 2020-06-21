@@ -4,6 +4,11 @@
 .ipynb_checkpoints
 *.pyc
 *~
+.envrc
+.direnv
+.commit
+
+rp-indexer
 
 # temba
 dump.rdb
@@ -30,9 +35,10 @@ temba/settings.py
 temba/smartmin
 temba.db
 smartmin
-
+mailroom_test.dump
 
 # Exclude media folder except files used for import testing
+media/apks
 media/contacts
 media/csv_imports
 media/flow
@@ -45,6 +51,7 @@ media/attachments
 
 
 # External projects
+fabric
 fabconfig.py
 fabfile.py
 deploy
@@ -97,7 +104,6 @@ coverage.xml
 js-coverage/
 
 # Translations
-*.mo
 *.pot
 
 # Django stuff:

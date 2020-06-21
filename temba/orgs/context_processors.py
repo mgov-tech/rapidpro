@@ -44,8 +44,8 @@ class GroupPermWrapper(object):
 
 def user_orgs_for_brand(request):
     if hasattr(request, "user"):
-        if not request.user.is_anonymous():
-            user_orgs = request.user.get_user_orgs(request.branding.get("brand"))
+        if not request.user.is_anonymous:
+            user_orgs = request.user.get_user_orgs(request.branding.get("keys", []))
             return dict(user_orgs=user_orgs)
     return {}
 
@@ -58,7 +58,7 @@ def user_group_perms_processor(request):
     group = None
 
     if hasattr(request, "user"):
-        if request.user.is_anonymous():
+        if request.user.is_anonymous:
             group = None
         else:
             group = request.user.get_org_group()

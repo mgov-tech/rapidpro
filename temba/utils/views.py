@@ -1,14 +1,13 @@
+import logging
 
 from django import forms
-from django.core.paginator import Paginator
+from django.db import transaction
 from django.http import HttpResponse
-from django.utils.functional import cached_property
 from django.utils.translation import ugettext_lazy as _
 from django.views import View
+from django.views.decorators.csrf import csrf_exempt
 
-from temba.contacts.models import ContactGroupCount
-from temba.utils.es import ModelESSearch
-from temba.utils.models import ProxyQuerySet, mapEStoDB
+logger = logging.getLogger(__name__)
 
 
 class PostOnlyMixin(View):
@@ -18,6 +17,16 @@ class PostOnlyMixin(View):
 
     def get(self, *args, **kwargs):
         return HttpResponse("Method Not Allowed", status=405)
+
+
+class NonAtomicMixin(View):
+    """
+    Utility mixin to disable automatic transaction wrapping of a class based view
+    """
+
+    @transaction.non_atomic_requests
+    def dispatch(self, request, *args, **kwargs):
+        return super().dispatch(request, *args, **kwargs)
 
 
 class BaseActionForm(forms.Form):
@@ -62,7 +71,10 @@ class BaseActionForm(forms.Form):
         delete_allowed = user_permissions.filter(codename="msg_update")
         resend_allowed = user_permissions.filter(codename="broadcast_send")
 
-        if action in ("label", "unlabel", "archive", "restore", "block", "unblock", "unstop") and not update_allowed:
+        if (
+            action in ("label", "unlabel", "archive", "restore", "block", "unblock", "unstop", "close", "reopen")
+            and not update_allowed
+        ):
             raise forms.ValidationError(_("Sorry you have no permission for this action."))
 
         if action == "delete" and not delete_allowed:  # pragma: needs cover
@@ -132,52 +144,35 @@ class BaseActionForm(forms.Form):
             changed = self.model.apply_action_resend(self.user, objects)
             return dict(changed=changed)
 
+        elif action == "close":
+            changed = self.model.apply_action_close(objects)
+            return dict(changed=changed)
+
+        elif action == "reopen":
+            changed = self.model.apply_action_reopen(objects)
+            return dict(changed=changed)
+
         else:  # pragma: no cover
             return dict(error=_("Oops, so sorry. Something went wrong!"))
 
 
-class ContactListPaginator(Paginator):
+class ExternalURLHandler(View):
     """
-    Paginator that knows how to work with ES dsl Search objects
+    It's useful to register Courier and Mailroom URLs in RapidPro so they can be used in templates, and if they are hit
+    here, we can provide the user with a error message about
     """
 
-    @cached_property
-    def count(self):
-        if isinstance(self.object_list, ModelESSearch):
-            # execute search on the ElasticSearch to get the count
-            return self.object_list.count()
-        else:
-            # get the group count from the ContactGroupCount squashed model
-            group_instance = self.object_list._hints.get("instance")
-            if group_instance:
-                return ContactGroupCount.get_totals([group_instance]).get(group_instance)
-            else:
-                return 0
+    service = None
 
-    def _get_page(self, *args, **kwargs):
-        new_args = list(args)
-
-        es_search = args[0]
-
-        if isinstance(es_search, ModelESSearch):
-            # we need to execute the ES search again, to get the actual page of records
-            new_object_list = args[0].execute()
-
-            new_args[0] = new_object_list
-
-        return super()._get_page(*new_args, **kwargs)
+    @csrf_exempt
+    def dispatch(self, request, *args, **kwargs):
+        logger.error(f"URL intended for {self.service} reached RapidPro", extra={"URL": request.get_full_path()})
+        return HttpResponse(f"this URL should be mapped to a {self.service} instance", status=404)
 
 
-class ContactListPaginationMixin(object):
-    paginator_class = ContactListPaginator
+class CourierURLHandler(ExternalURLHandler):
+    service = "Courier"
 
-    def paginate_queryset(self, queryset, page_size):
-        paginator, page, new_queryset, is_paginated = super().paginate_queryset(queryset, page_size)
 
-        if isinstance(queryset, ModelESSearch):
-            model_queryset = ProxyQuerySet([obj for obj in mapEStoDB(self.model, new_queryset)])
-            return paginator, page, model_queryset, is_paginated
-
-        else:
-            model_queryset = ProxyQuerySet([obj for obj in new_queryset])
-            return paginator, page, model_queryset, is_paginated
+class MailroomURLHandler(ExternalURLHandler):
+    service = "Mailroom"

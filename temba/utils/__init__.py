@@ -1,19 +1,14 @@
-import datetime
-import iso8601
-import json
 import locale
 import resource
+from itertools import islice
 
-from decimal import Decimal
+import iso8601
+from django_countries import countries
+
 from django.conf import settings
 from django.db import transaction
-from django.utils.timezone import is_aware
-from django_countries import countries
-from itertools import islice
-from .dates import datetime_to_json_date
 
-
-TRANSFERTO_COUNTRY_NAMES = {"Democratic Republic of the Congo": "CD", "Ivory Coast": "CI", "United States": "US"}
+DTONE_COUNTRY_NAMES = {"Democratic Republic of the Congo": "CD", "Ivory Coast": "CI", "United States": "US"}
 
 
 def str_to_bool(text):
@@ -30,7 +25,7 @@ def percentage(numerator, denominator):
     if not denominator or not numerator:
         return 0
 
-    return int(100.0 * numerator / denominator + .5)
+    return int(100.0 * numerator / denominator + 0.5)
 
 
 def format_number(val):
@@ -46,9 +41,7 @@ def format_number(val):
     if not val.is_finite():
         return ""
 
-    # convert our decimal to a value without exponent
-    val = val.quantize(Decimal(1)) if val == val.to_integral() else val.normalize()
-    val = str(val)
+    val = format(val, "f")
 
     if "." in val:
         val = val.rstrip("0").rstrip(".")  # e.g. 12.3000 -> 12.3
@@ -131,37 +124,6 @@ def prepped_request_to_str(prepped):
     )
 
 
-class DateTimeJsonEncoder(json.JSONEncoder):
-    """
-    Our own encoder for datetimes.. we always convert to UTC and always include milliseconds
-    """
-
-    def default(self, o):
-        # See "Date Time String Format" in the ECMA-262 specification.
-        if isinstance(o, datetime.datetime):
-            return datetime_to_json_date(o)
-        elif isinstance(o, datetime.date):
-            return o.isoformat()
-        elif isinstance(o, datetime.time):
-            if is_aware(o):
-                raise ValueError("JSON can't represent timezone-aware times.")
-            r = o.isoformat()
-            if o.microsecond:
-                r = r[:12]
-            return r
-        elif isinstance(o, Decimal):
-            return str(o)
-        else:
-            return super().default(o)
-
-
-def dict_to_json(dictionary):
-    """
-    Converts a dictionary to JSON, taking care of converting dates as needed.
-    """
-    return json.dumps(dictionary, cls=DateTimeJsonEncoder)
-
-
 def splitting_getlist(request, name, default=None):
     """
     Used for backward compatibility in the API where some list params can be provided as comma separated values
@@ -203,7 +165,7 @@ def get_country_code_by_name(name):
     code = countries.by_name(name)
 
     if not code:
-        code = TRANSFERTO_COUNTRY_NAMES.get(name, None)
+        code = DTONE_COUNTRY_NAMES.get(name, None)
 
     return code if code else None
 
